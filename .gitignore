@@ -1,0 +1,13 @@
+# Local cluster state & credentials
+cluster.conf
+*.session
+*.local
+.env*
+
+# Editor & OS artifacts
+.DS_Store
+Thumbs.db
+*.swp
+*~
+__pycache__/
+*.pyc

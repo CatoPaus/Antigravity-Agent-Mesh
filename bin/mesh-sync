@@ -1,0 +1,194 @@
+#!/usr/bin/env bash
+# mesh-sync: Project-agnostic Git bare-repo + NUMA worktree synchronizer
+# Usage:
+#   mesh-sync [push] [--keep-build]
+#   mesh-sync status
+#   mesh-sync fetch
+#   mesh-sync list
+#   mesh-sync drop [project_name]
+set -euo pipefail
+
+MESH_CONFIG="${MESH_CONFIG:-${HOME}/.config/mesh/cluster.conf}"
+if [ -f "$MESH_CONFIG" ]; then
+  # shellcheck disable=SC1090
+  source "$MESH_CONFIG"
+fi
+
+if [ "${#MESH_NODES[@]}" -eq 0 ] 2>/dev/null; then
+  echo "Error: No nodes configured. Run bootstrap-mesh.sh or create ${MESH_CONFIG}." >&2
+  exit 1
+fi
+
+NODE_NAMES=()
+NODE_NUMAS=()
+for entry in "${MESH_NODES[@]}"; do
+  IFS="|" read -r _name _ip _mac _numa _persona _desc <<< "$entry"
+  NODE_NAMES+=("$_name")
+  NODE_NUMAS+=("${_numa:-2}")
+done
+
+ACTION="push"
+PRESERVE_FLAG=""
+TARGET_PROJECT=""
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    push|status|fetch|list) ACTION="$1" ;;
+    drop|prune)
+      ACTION="drop"
+      if [ $# -gt 1 ] && [[ ! "$2" =~ ^-- ]]; then
+        TARGET_PROJECT="$2"
+        shift
+      fi
+      ;;
+    --keep-build|--preserve-untracked) PRESERVE_FLAG="--preserve-untracked" ;;
+    -h|--help)
+      sed -n '2,8p' "$0" | sed 's/^# \{0,1\}//'
+      exit 0
+      ;;
+    *) echo "Usage: mesh-sync [push|status|fetch|list|drop [project_name]] [--keep-build]" >&2; exit 1 ;;
+  esac
+  shift
+done
+
+if [ -x /usr/local/bin/mesh-power ]; then
+  /usr/local/bin/mesh-power ensure
+fi
+
+if [ "$ACTION" = "list" ]; then
+  for host in "${NODE_NAMES[@]}"; do
+    echo "=== [ $host (/opt/mesh) ] ==="
+    ssh -T "$host" '
+      for repo in /opt/mesh/repos/*.git; do
+        [ -e "$repo" ] || { echo "  (no projects on cluster)"; break; }
+        p=$(basename "$repo" .git)
+        sz=$(du -sh "$repo" /opt/mesh/workspaces/node*/"$p" 2>/dev/null | awk "{printf \"%s \", \$1}")
+        printf "  - %-28s (sizes: %s)\n" "$p" "$sz"
+      done
+    '
+  done
+  exit 0
+fi
+
+if [ -n "$TARGET_PROJECT" ]; then
+  PROJECT="$(basename "$TARGET_PROJECT" .git)"
+else
+  TOPLEVEL=$(git rev-parse --show-toplevel 2>/dev/null || { echo "Error: Not inside a Git repository. Pass project name explicitly: mesh-sync drop <project_name>" >&2; exit 1; })
+  PROJECT=$(basename "$TOPLEVEL")
+  cd "$TOPLEVEL"
+fi
+
+if [[ -z "$PROJECT" || "$PROJECT" = "." || "$PROJECT" = ".." || "$PROJECT" =~ [/[:space:]\$\`\'\"\\] ]]; then
+  echo "Error: Invalid project name '$PROJECT'" >&2
+  exit 1
+fi
+
+create_working_snapshot() {
+  if [ -z "$(git status --porcelain)" ]; then
+    git rev-parse HEAD
+    return 0
+  fi
+
+  local tmp_idx
+  tmp_idx=$(mktemp /tmp/mesh-sync-index.XXXXXX)
+  trap 'rm -f "${tmp_idx:-}" "${tmp_idx:-}.lock"' RETURN
+  cp -p "$(git rev-parse --git-path index)" "$tmp_idx" 2>/dev/null || rm -f "$tmp_idx"
+  GIT_INDEX_FILE="$tmp_idx" git add -A
+  local tree_oid
+  tree_oid=$(GIT_INDEX_FILE="$tmp_idx" git write-tree)
+
+  local head_oid
+  head_oid=$(git rev-parse HEAD)
+  git commit-tree "$tree_oid" -p "$head_oid" -m "mesh-sync ephemeral working tree snapshot"
+}
+
+wait_all() {
+  local rc=0
+  for pid in "$@"; do
+    wait "$pid" || rc=1
+  done
+  return "$rc"
+}
+
+case "$ACTION" in
+  push)
+    if ! git rev-parse --verify HEAD >/dev/null 2>&1; then
+      echo "Error: Repository '$PROJECT' has no commits yet. Make an initial commit first." >&2
+      exit 1
+    fi
+
+    HEAD_REV=$(git rev-parse HEAD)
+    SYNC_REV=$(create_working_snapshot)
+    if [ "$SYNC_REV" = "$HEAD_REV" ]; then
+      STATE_LABEL="clean-HEAD ($(git rev-parse --short "$SYNC_REV"))"
+    else
+      STATE_LABEL="dirty+untracked-snapshot ($(git rev-parse --short "$SYNC_REV"))"
+    fi
+
+    echo "Syncing project '$PROJECT' [$STATE_LABEL] across cluster NUMA worktrees..."
+    pids=()
+    for host in "${NODE_NAMES[@]}"; do
+      (
+        ssh -T "$host" "echo 0 > /run/ag-idle-minutes 2>/dev/null || true; mkdir -p '/opt/mesh/repos/${PROJECT}.git' && [ -d '/opt/mesh/repos/${PROJECT}.git/objects' ] || git init --bare --initial-branch=main '/opt/mesh/repos/${PROJECT}.git' >/dev/null"
+        git push --quiet --force "ssh://${host}/opt/mesh/repos/${PROJECT}.git" "${SYNC_REV}:refs/heads/mesh-sync"
+        ssh -T "$host" "/usr/local/bin/ag-mesh-worktree '$PROJECT' refs/heads/mesh-sync $PRESERVE_FLAG"
+      ) &
+      pids+=("$!")
+    done
+    wait_all "${pids[@]}"
+    ;;
+
+  status)
+    pids=()
+    for idx in "${!NODE_NAMES[@]}"; do
+      host="${NODE_NAMES[$idx]}"
+      numas="${NODE_NUMAS[$idx]}"
+      for ((node=0; node<numas; node++)); do
+        ssh -T "$host" "
+          WT='/opt/mesh/workspaces/node${node}/${PROJECT}'
+          if git -C \"\$WT\" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+            REV=\$(git -C \"\$WT\" rev-parse --short HEAD 2>/dev/null || echo 'none')
+            BR=\$(git -C \"\$WT\" symbolic-ref --short HEAD 2>/dev/null || echo 'detached')
+            DIRTY=\$(git -C \"\$WT\" status --porcelain 2>/dev/null | wc -l)
+            printf '[%-10s | node%s] %-22s | rev: %s | modified/untracked: %s\n' '$host' '$node' \"\$BR\" \"\$REV\" \"\$DIRTY\"
+          else
+            printf '[%-10s | node%s] NOT INITIALIZED (%s)\n' '$host' '$node' \"\$WT\"
+          fi
+        " &
+        pids+=("$!")
+      done
+    done
+    wait_all "${pids[@]}"
+    ;;
+
+  fetch)
+    echo "Fetching remote subagent branches for '$PROJECT'..."
+    for idx in "${!NODE_NAMES[@]}"; do
+      host="${NODE_NAMES[$idx]}"
+      numas="${NODE_NUMAS[$idx]}"
+      for ((node=0; node<numas; node++)); do
+        if git fetch --quiet --force "ssh://${host}/opt/mesh/repos/${PROJECT}.git" \
+          "refs/heads/mesh/${host}-node${node}:refs/remotes/mesh/${host}-node${node}" 2>/dev/null; then
+          REV=$(git rev-parse --short "refs/remotes/mesh/${host}-node${node}")
+          printf "Fetched mesh/%s-node%s -> %s (diff with: git diff HEAD..mesh/%s-node%s)\n" \
+            "$host" "$node" "$REV" "$host" "$node"
+        else
+          printf "Skipped mesh/%s-node%s (remote branch not yet initialized)\n" "$host" "$node"
+        fi
+      done
+    done
+    ;;
+
+  drop)
+    echo "Purging project '$PROJECT' from cluster nodes (${NODE_NAMES[*]})..."
+    pids=()
+    for host in "${NODE_NAMES[@]}"; do
+      ssh -T "$host" "
+        rm -rf /opt/mesh/workspaces/node*/'${PROJECT}' '/opt/mesh/repos/${PROJECT}.git'
+        printf '[%-10s] Purged /opt/mesh/repos/%s.git and all node worktrees.\n' '$host' '$PROJECT'
+      " &
+      pids+=("$!")
+    done
+    wait_all "${pids[@]}"
+    ;;
+esac

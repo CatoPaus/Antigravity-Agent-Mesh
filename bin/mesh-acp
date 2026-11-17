@@ -1,0 +1,368 @@
+#!/usr/bin/env python3
+"""
+mesh-acp: Event-driven ACP stdio dispatcher with automatic Git worktree inference (agy 1.5.1+).
+Usage:
+  mesh-acp <target|host|all> "<prompt>" [--sync] [--keep-build] [--fetch] [--subpath DIR] [--no-project]
+           [--model MODEL_ID] [--mode MODE_ID] [--resume SESSION_ID | --continue]
+           [--system-prompt TEXT] [--add-dir DIR] [--skip-perms] [--no-stream]
+  mesh-acp --list-targets
+"""
+import asyncio
+import argparse
+import json
+import os
+import re
+import subprocess
+import sys
+
+DEFAULT_TARGETS = ["node1-node0", "node1-node1", "node2-node0", "node2-node1"]
+STREAM_LIMIT = 16 * 1024 * 1024  # 16 MiB line buffer for large tool/diff payloads
+
+
+def load_cluster_targets() -> tuple[list[str], list[str]]:
+    """Read configured nodes from ~/.config/mesh/cluster.conf (or MESH_CONFIG)."""
+    conf_path = os.environ.get("MESH_CONFIG") or os.path.expanduser("~/.config/mesh/cluster.conf")
+    if not os.path.isfile(conf_path):
+        hosts = sorted({t.rsplit("-node", 1)[0] for t in DEFAULT_TARGETS})
+        return DEFAULT_TARGETS, hosts
+
+    hosts: list[str] = []
+    targets: list[str] = []
+    try:
+        with open(conf_path, "r", encoding="utf-8") as f:
+            text = f.read()
+        for match in re.finditer(r'"([^"|]+)\|[^"|]*\|[^"|]*\|(\d+)(?:\|[^"]*)?"', text):
+            alias = match.group(1).strip()
+            numa_count = max(1, int(match.group(2)))
+            hosts.append(alias)
+            for idx in range(numa_count):
+                targets.append(f"{alias}-node{idx}")
+    except Exception:
+        pass
+
+    if not targets:
+        hosts = sorted({t.rsplit("-node", 1)[0] for t in DEFAULT_TARGETS})
+        return DEFAULT_TARGETS, hosts
+    return targets, hosts
+
+
+def resolve_targets(spec: str, all_targets: list[str], hosts: list[str]) -> list[str]:
+    """Expand 'all', host alias, comma-separated targets, or single '<host>-node<N>'."""
+    if spec == "all":
+        return all_targets
+    chosen: list[str] = []
+    for part in (p.strip() for p in spec.split(",") if p.strip()):
+        if part in all_targets:
+            chosen.append(part)
+        elif part in hosts:
+            chosen.extend(t for t in all_targets if t.startswith(f"{part}-node"))
+        else:
+            raise SystemExit(
+                f"Error: Unknown target '{part}'. Valid targets: {', '.join(all_targets)} (or host alias: {', '.join(hosts)}, or 'all')"
+            )
+    return list(dict.fromkeys(chosen))
+
+
+def session_cache_path(target: str) -> str:
+    return f"/tmp/mesh-acp-last-{target}.session"
+
+
+def load_last_session(target: str) -> str | None:
+    path = session_cache_path(target)
+    try:
+        if os.path.exists(path):
+            with open(path, "r", encoding="utf-8") as f:
+                val = f.read().strip()
+                return val or None
+    except Exception:
+        pass
+    return None
+
+
+def save_last_session(target: str, session_id: str) -> None:
+    try:
+        with open(session_cache_path(target), "w", encoding="utf-8") as f:
+            f.write(session_id.strip() + "\n")
+    except Exception:
+        pass
+
+
+def detect_git_project() -> str | None:
+    try:
+        out = subprocess.check_output(
+            ["git", "rev-parse", "--show-toplevel"],
+            stderr=subprocess.DEVNULL,
+            text=True,
+        ).strip()
+        return os.path.basename(out) if out else None
+    except Exception:
+        return None
+
+
+def parse_target(target: str, subpath_override: str | None, auto_project: str | None):
+    host, node_str = target.rsplit("-node", 1)
+    if subpath_override:
+        if re.match(r"^node\d+(/|$)", subpath_override):
+            subpath = subpath_override
+        else:
+            subpath = f"node{node_str}/{subpath_override.lstrip('/')}"
+    elif auto_project:
+        subpath = f"node{node_str}/{auto_project}"
+    else:
+        subpath = f"node{node_str}"
+    cwd = f"/opt/mesh/workspaces/{subpath}"
+    return host, node_str, subpath, cwd
+
+
+async def run_worker(target: str, prompt: str, args, auto_project: str | None, multi: bool) -> int:
+    host, node_str, subpath, cwd = parse_target(target, args.subpath, auto_project)
+    cmd = ["ssh", "-T", host, "/usr/local/bin/ag-acp-worker", node_str, subpath]
+    if args.skip_perms:
+        cmd.append("--dangerously-skip-permissions")
+
+    proc = await asyncio.create_subprocess_exec(
+        *cmd,
+        stdin=asyncio.subprocess.PIPE,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+        limit=STREAM_LIMIT,
+    )
+
+    async def send(payload: dict):
+        line = json.dumps(payload, separators=(",", ":")) + "\n"
+        proc.stdin.write(line.encode("utf-8"))
+        await proc.stdin.drain()
+
+    async def handle_server_request(msg: dict):
+        method = msg.get("method", "")
+        if method in ("session/request_permission", "session/requestPermission"):
+            options = msg.get("params", {}).get("options", [])
+            allow_id = next(
+                (o.get("optionId") or o.get("id") for o in options if "allow" in (o.get("kind", "") + o.get("optionId", "")).lower()),
+                "allow_always",
+            )
+            await send({"jsonrpc": "2.0", "id": msg["id"], "result": {"outcome": {"outcome": "selected", "optionId": allow_id}}})
+        else:
+            await send({"jsonrpc": "2.0", "id": msg["id"], "result": {}})
+
+    async def recv_until_id(expected_id: int) -> dict:
+        while True:
+            raw = await proc.stdout.readline()
+            if not raw:
+                err = (await proc.stderr.read()).decode("utf-8", errors="replace").strip()
+                raise RuntimeError(f"[{target}] EOF waiting for id={expected_id}. stderr: {err}")
+            line = raw.decode("utf-8", errors="replace").strip()
+            if not line.startswith("{"):
+                continue
+            msg = json.loads(line)
+
+            if "id" in msg and "method" in msg:
+                await handle_server_request(msg)
+                continue
+
+            if msg.get("method") in ("session/update", "notifications/message"):
+                params = msg.get("params", {})
+                update = params.get("update", params)
+                kind = update.get("sessionUpdate") or update.get("type") or ""
+                if kind == "agent_message_chunk":
+                    text = update.get("content", {}).get("text", "")
+                    if text and args.stream and not multi:
+                        sys.stdout.write(text)
+                        sys.stdout.flush()
+                continue
+
+            if msg.get("id") == expected_id:
+                if "error" in msg:
+                    raise RuntimeError(f"[{target}] RPC Error on id={expected_id}: {msg['error']}")
+                return msg.get("result", {})
+
+    try:
+        # 1. Initialize (agy 1.5.1+ exposes all account models; 1.5.10+ adds 10m thinking & 4m retry backoff)
+        await send({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": 1,
+                "clientCapabilities": {},
+                "clientInfo": {"name": "mesh-acp", "version": "1.5.10"},
+            },
+        })
+        await recv_until_id(1)
+
+        # 2. Create or Resume Session in target NUMA worktree
+        next_id = 2
+        session_params: dict = {"cwd": cwd, "mcpServers": []}
+        if args.add_dir:
+            session_params["additionalDirectories"] = args.add_dir
+        if args.system_prompt:
+            session_params["_meta"] = {"antigravity": {"systemPrompt": {"append": args.system_prompt}}}
+
+        resume_id = args.resume or (load_last_session(target) if args.continue_last else None)
+        session_id = None
+        if resume_id:
+            try:
+                resume_params = dict(session_params)
+                resume_params["sessionId"] = resume_id
+                await send({
+                    "jsonrpc": "2.0",
+                    "id": next_id,
+                    "method": "session/resume",
+                    "params": resume_params,
+                })
+                sess = await recv_until_id(next_id)
+                session_id = sess.get("sessionId") or resume_id
+                next_id += 1
+            except Exception:
+                next_id += 1
+                session_id = None
+
+        if not session_id:
+            await send({
+                "jsonrpc": "2.0",
+                "id": next_id,
+                "method": "session/new",
+                "params": session_params,
+            })
+            sess = await recv_until_id(next_id)
+            session_id = sess["sessionId"]
+            next_id += 1
+
+        save_last_session(target, session_id)
+
+        # 3. Mode override
+        if args.mode:
+            await send({
+                "jsonrpc": "2.0",
+                "id": next_id,
+                "method": "session/set_mode",
+                "params": {"sessionId": session_id, "modeId": args.mode},
+            })
+            await recv_until_id(next_id)
+            next_id += 1
+
+        # 4. Model override
+        if args.model:
+            await send({
+                "jsonrpc": "2.0",
+                "id": next_id,
+                "method": "session/set_model",
+                "params": {"sessionId": session_id, "modelId": args.model},
+            })
+            await recv_until_id(next_id)
+            next_id += 1
+
+        # 5. Dispatch prompt
+        chunks = []
+        await send({
+            "jsonrpc": "2.0",
+            "id": next_id,
+            "method": "session/prompt",
+            "params": {
+                "sessionId": session_id,
+                "prompt": [{"type": "text", "text": prompt}],
+            },
+        })
+
+        while True:
+            raw = await proc.stdout.readline()
+            if not raw:
+                break
+            line = raw.decode("utf-8", errors="replace").strip()
+            if not line.startswith("{"):
+                continue
+            msg = json.loads(line)
+
+            if "id" in msg and "method" in msg:
+                await handle_server_request(msg)
+                continue
+
+            if msg.get("method") == "session/update":
+                update = msg.get("params", {}).get("update", {})
+                if update.get("sessionUpdate") == "agent_message_chunk":
+                    t = update.get("content", {}).get("text", "")
+                    if t:
+                        chunks.append(t)
+                        if args.stream and not multi:
+                            sys.stdout.write(t)
+                            sys.stdout.flush()
+                continue
+
+            if msg.get("id") == next_id:
+                if "error" in msg:
+                    raise RuntimeError(f"[{target}] Prompt error: {msg['error']}")
+                if not chunks and isinstance(msg.get("result"), dict):
+                    txt = msg["result"].get("text", "")
+                    if txt:
+                        chunks.append(txt)
+                break
+
+        if not args.stream or multi:
+            full_text = "".join(chunks).strip()
+            print(f"\n=== [ {target} | cwd: {cwd} | session {session_id} ] ===\n{full_text}")
+        else:
+            print()
+
+        proc.stdin.close()
+        await proc.wait()
+        return 0
+    except Exception as exc:
+        sys.stderr.write(f"{exc}\n")
+        proc.kill()
+        return 1
+
+
+async def main():
+    all_targets, hosts = load_cluster_targets()
+
+    parser = argparse.ArgumentParser(description="Dispatch ACP prompts to NUMA subagents (agy 1.5.1+).")
+    parser.add_argument("target", nargs="?", help=f"Target ({', '.join(all_targets)}, host alias, comma-list, or 'all')")
+    parser.add_argument("prompt", nargs="?", help="Prompt text to execute on the subagent(s)")
+    parser.add_argument("--list-targets", action="store_true", help="Print configured cluster targets and exit")
+    parser.add_argument("--subpath", default=None, help="Explicit workspace subdir under /opt/mesh/workspaces/")
+    parser.add_argument("--no-project", action="store_true", help="Do not auto-infer project subpath from current Git repo")
+    parser.add_argument("--sync", action="store_true", help="Run 'mesh-sync push' before dispatching prompt")
+    parser.add_argument("--keep-build", action="store_true", help="Pass --keep-build to mesh-sync when --sync is used")
+    parser.add_argument("--fetch", action="store_true", help="Run 'mesh-sync fetch' after subagent prompt completes")
+    parser.add_argument("--mode", default="accept-edits", help="Session mode (default, accept-edits, plan)")
+    parser.add_argument("--model", default=None, help="Override modelId (e.g., gemini-4-argon-high, gemini-3.8-flash-high)")
+    parser.add_argument("--resume", default=None, help="Resume a specific ACP sessionId via session/resume (agy 1.5.0+)")
+    parser.add_argument("-c", "--continue", dest="continue_last", action="store_true", help="Resume the most recent ACP session on the target socket(s)")
+    parser.add_argument("--system-prompt", default=None, help="Append custom instructions via _meta.antigravity.systemPrompt.append")
+    parser.add_argument("--add-dir", action="append", default=None, help="Expose additional directory to session (repeatable)")
+    parser.add_argument("--skip-perms", action="store_true", help="Pass --dangerously-skip-permissions to agy acp")
+    parser.add_argument("--no-stream", dest="stream", action="store_false", help="Disable live token streaming")
+    args = parser.parse_args()
+
+    if args.list_targets:
+        for t in all_targets:
+            print(t)
+        return
+
+    if not args.target or not args.prompt:
+        parser.error("target and prompt are required (unless --list-targets is specified)")
+
+    targets = resolve_targets(args.target, all_targets, hosts)
+    auto_project = None if (args.no_project or args.subpath is not None) else detect_git_project()
+
+    if os.path.exists("/usr/local/bin/mesh-power"):
+        subprocess.run(["/usr/local/bin/mesh-power", "ensure"], check=True)
+
+    if args.sync:
+        sync_cmd = ["/usr/local/bin/mesh-sync", "push"]
+        if args.keep_build:
+            sync_cmd.append("--keep-build")
+        subprocess.run(sync_cmd, check=True)
+
+    multi = len(targets) > 1
+    results = await asyncio.gather(*(run_worker(t, args.prompt, args, auto_project, multi) for t in targets))
+    rc = max(results)
+
+    if args.fetch and rc == 0:
+        subprocess.run(["/usr/local/bin/mesh-sync", "fetch"], check=True)
+
+    sys.exit(rc)
+
+
+if __name__ == "__main__":
+    asyncio.run(main())

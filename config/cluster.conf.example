@@ -1,0 +1,23 @@
+# Antigravity Agent Mesh — Example Cluster Configuration
+# Copy to ~/.config/mesh/cluster.conf or let ./bootstrap-mesh.sh generate it.
+#
+# Override path at runtime via: export MESH_CONFIG=/path/to/cluster.conf
+
+MESH_USER="ag-worker"
+MESH_BCAST="192.168.1.255"
+MESH_PRIMARY_NIC="enp0s25"
+MESH_SECONDARY_NIC="enp7s0"
+MESH_IDLE_MINUTES="30"
+
+# Node entry format:
+#   "ssh_alias|ip_address|mac_address|numa_nodes|tts_persona|hardware_note"
+#   - ssh_alias:   Hostname/alias in ~/.ssh/config
+#   - ip_address:  Static LAN IP for ICMP/WoL status checks
+#   - mac_address: Primary NIC MAC for Wake-on-LAN (00:00:00:00:00:00 if unused)
+#   - numa_nodes:  Number of NUMA sockets on this machine (e.g., 2 for dual-socket)
+#   - tts_persona: tars | case | none
+#   - hardware_note: Human-readable CPU/RAM note used in acpServers descriptions
+MESH_NODES=(
+  "node1|192.168.1.210|00:11:22:33:44:10|2|tars|Dual-Socket NUMA Worker 1"
+  "node2|192.168.1.211|00:11:22:33:44:20|2|case|Dual-Socket NUMA Worker 2"
+)
