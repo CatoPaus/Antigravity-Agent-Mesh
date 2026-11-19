@@ -42,12 +42,14 @@ sequenceDiagram
 
 ### Antigravity 2.0 Modes Comparison
 
-| Feature | **Remote Agents** *(Cloud)* | **Remote Control** *(Host Daemon)* | **NUMA Compute Mesh** *(This Repo)* |
-| :--- | :--- | :--- | :--- |
-| **Execution** | Google-managed cloud container | Whole remote server via UI switcher | **Per-socket NUMA + cgroup** over direct LAN SSH |
-| **Code Sync** | Requires GitHub push or upload | Reads `/opt/mesh/workspaces` | **`mesh-sync`:** Pushes live uncommitted + untracked edits in ~1s |
-| **Parallelism** | 1 cloud agent per conversation | 1 interactive GUI per host | **Parallel fan-out (`mesh-acp all`)** across every socket |
-| **Power** | Always on in cloud | Requires host powered on | **Auto-wakes via WoL** + auto-sleeps when idle |
+| Feature | **Remote Agents** *(Cloud)* | **Remote Control** *(Host Daemon)* | **Connect over SSH** *(App `v2.33.0+`)* | **NUMA Compute Mesh** *(This Repo)* |
+| :--- | :--- | :--- | :--- | :--- |
+| **Execution** | Google-managed cloud container | Whole remote server via browser UI | 1 interactive App window → 1 Linux host | **Per-socket NUMA + cgroup** across multiple hosts |
+| **Code Sync** | Requires GitHub push or upload | Reads remote workspace directory | Edits directly on remote host filesystem | **`mesh-sync`:** Pushes live dirty + untracked edits in ~1s |
+| **Parallelism** | 1 cloud agent per conversation | 1 interactive session per host | 1 host per `(SSH: <host>)` window | **Parallel fan-out (`mesh-acp all`)** across every socket |
+| **Power** | Always on in cloud | Requires host powered on | Requires host powered on | **Auto-wakes via S5 WoL** + auto-sleeps when idle |
+
+> **Pairs cleanly with Connect over SSH:** Use Antigravity's built-in `(SSH: <host>)` window when you want an interactive GUI session directly on one node, and use `mesh-acp` + `mesh-sync` when you want a single prompt fanned out across all 4 NUMA sockets with automatic Wake-on-LAN and shared `ccache`.
 
 ---
 
