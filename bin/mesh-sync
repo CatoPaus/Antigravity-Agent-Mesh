@@ -58,7 +58,7 @@ fi
 if [ "$ACTION" = "list" ]; then
   for host in "${NODE_NAMES[@]}"; do
     echo "=== [ $host (/opt/mesh) ] ==="
-    ssh -T "$host" '
+    ssh -n -T "$host" '
       for repo in /opt/mesh/repos/*.git; do
         [ -e "$repo" ] || { echo "  (no projects on cluster)"; break; }
         p=$(basename "$repo" .git)
@@ -129,9 +129,9 @@ case "$ACTION" in
     pids=()
     for host in "${NODE_NAMES[@]}"; do
       (
-        ssh -T "$host" "echo 0 > /run/ag-idle-minutes 2>/dev/null || true; mkdir -p '/opt/mesh/repos/${PROJECT}.git' && [ -d '/opt/mesh/repos/${PROJECT}.git/objects' ] || git init --bare --initial-branch=main '/opt/mesh/repos/${PROJECT}.git' >/dev/null"
+        ssh -n -T "$host" "echo 0 > /run/ag-idle-minutes 2>/dev/null || true; mkdir -p '/opt/mesh/repos/${PROJECT}.git' && [ -d '/opt/mesh/repos/${PROJECT}.git/objects' ] || git init --bare --initial-branch=main '/opt/mesh/repos/${PROJECT}.git' >/dev/null"
         git push --quiet --force "ssh://${host}/opt/mesh/repos/${PROJECT}.git" "${SYNC_REV}:refs/heads/mesh-sync"
-        ssh -T "$host" "/usr/local/bin/ag-mesh-worktree '$PROJECT' refs/heads/mesh-sync $PRESERVE_FLAG"
+        ssh -n -T "$host" "/usr/local/bin/ag-mesh-worktree '$PROJECT' refs/heads/mesh-sync $PRESERVE_FLAG"
       ) &
       pids+=("$!")
     done
@@ -144,7 +144,7 @@ case "$ACTION" in
       host="${NODE_NAMES[$idx]}"
       numas="${NODE_NUMAS[$idx]}"
       for ((node=0; node<numas; node++)); do
-        ssh -T "$host" "
+        ssh -n -T "$host" "
           WT='/opt/mesh/workspaces/node${node}/${PROJECT}'
           if git -C \"\$WT\" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
             REV=\$(git -C \"\$WT\" rev-parse --short HEAD 2>/dev/null || echo 'none')
@@ -183,7 +183,7 @@ case "$ACTION" in
     echo "Purging project '$PROJECT' from cluster nodes (${NODE_NAMES[*]})..."
     pids=()
     for host in "${NODE_NAMES[@]}"; do
-      ssh -T "$host" "
+      ssh -n -T "$host" "
         rm -rf /opt/mesh/workspaces/node*/'${PROJECT}' '/opt/mesh/repos/${PROJECT}.git'
         printf '[%-10s] Purged /opt/mesh/repos/%s.git and all node worktrees.\n' '$host' '$PROJECT'
       " &

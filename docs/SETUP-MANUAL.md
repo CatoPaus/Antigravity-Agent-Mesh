@@ -26,6 +26,7 @@ This manual covers setting up a multi-node NUMA compute mesh for **Google Antigr
      ssh -t "ag-worker@${ip}" "echo 'ag-worker ALL=(ALL) NOPASSWD:ALL' | sudo tee /etc/sudoers.d/90-ag-worker && sudo chmod 0440 /etc/sudoers.d/90-ag-worker"
    done
    ```
+   *(If you use the Antigravity App on Windows with **Connect over SSH**, ensure your SSH key is also loaded in Windows `ssh-agent` and run `ssh <host>` once from a Windows terminal to populate Windows `known_hosts`. `provision-node.sh` automatically configures `AllowTcpForwarding yes` on the nodes.)*
 
 ---
 
@@ -47,13 +48,15 @@ chmod +x bootstrap-mesh.sh provision-node.sh bin/* scripts/*
 *(Leaving the MAC field empty between the two commas—`alias=ip,,persona`—tells `bootstrap-mesh.sh` to auto-discover the live MAC address over SSH. You can also pass an explicit MAC like `node1=192.168.1.210,aa:bb:cc:dd:ee:ff,tars`.)*
 
 ### Optional Flags
+- `--ssh-autowake` — Adds a `Match originalhost <alias> exec ...` WoL hook in `~/.ssh/config` (WSL & Windows) so connecting from the Antigravity App wakes sleeping S5 nodes automatically.
+- `--sync-node-rules` / `--no-node-rules` — Installs (or skips) [`rules/mesh-node.md`](../rules/mesh-node.md) into `~/.gemini/` on remote nodes for `(SSH: <host>)` sessions.
 - `--with-eda` — Installs KiCad 10 PPA, headless JRE, and `/opt/mesh/tools/freerouting.jar`.
 - `--with-embedded` — Installs `gcc-arm-none-eabi`, `libnewlib-arm-none-eabi`, and `libstdc++-arm-none-eabi-newlib`.
 - `--no-tts` — Skips ALSA, SoX, `espeak-ng`, and MBROLA speaker setup.
 - `--no-dell-bios` / `--dell-bios` — Overrides automatic Dell DMI detection for `cctk` BIOS tuning.
 - `--idle-minutes <N>` — Sets idle timeout before S5 poweroff (`30` default; `0` disables `ag-idle-watchdog.timer`).
 - `--ccache-size <size>` — Sets shared `ccache` limit (`25.0G` default).
-- `--control-plane-only` — Updates local `/usr/local/bin/mesh-*`, `~/.config/mesh/cluster.conf`, and rules without touching remote nodes.
+- `--control-plane-only` — Updates local `/usr/local/bin/mesh-*`, `~/.config/mesh/cluster.conf`, SSH configs, and rules without touching remote nodes.
 
 ### Authenticating `agy` on Nodes
 If you did not use `--sync-auth` (or need fresh headless credentials), authenticate once per node:
@@ -70,6 +73,13 @@ ssh -t node2 "~/.local/bin/agy acp --login"
 In the Antigravity 2.0 left-hand sidebar under **Settings**:
 1. **Skills & Customizations → Rules:** Confirm `mesh-cluster.md` (`GEMINI.md`) is active.
 2. **Tool Execution Policy:** Set to `always-proceed` or allowlist `wsl -d Ubuntu*`, `/usr/local/bin/mesh-*`, and `git *` so the Lead Agent can dispatch multi-socket jobs uninterrupted.
+
+### Hybrid Workflow: Antigravity **Connect over SSH** (`v2.33.0+`) + `mesh-acp`
+Because `bootstrap-mesh.sh` writes concrete `Host` entries in both WSL and Windows `~/.ssh/config`, each compute node appears directly under **SSH Host…** in the Antigravity App (`(SSH: node1)` / `(SSH: node2)`):
+- **Wake a sleeping node before connecting:** Run `mesh-power ensure node1` (or enable `--ssh-autowake` in `bootstrap-mesh.sh`).
+- **Open the right folder on the node:** Open projects under `/opt/mesh/workspaces/node0/<project>` (or `/opt/mesh/workspaces/...`), not `$HOME`, so `mesh-hygiene clean` keeps `$HOME` tidy while preserving `~/.antigravity-hub-server/` and `~/.gemini/`.
+- **Avoid overwriting interactive edits:** `mesh-sync push` resets `/opt/mesh/workspaces/node<N>/<project>` via `git reset --hard`. If you edit code inside an `(SSH: <host>)` window, commit it to `mesh/<host>-node<N>` and run `mesh-sync fetch` locally before running `mesh-sync push` again.
+- **Stop vs. close:** Closing an `(SSH: <host>)` window leaves running agents active on the node (protected by `ag-idle-watchdog` while active agents or recent logs are detected). Use **Stop SSH Server…** when completely done, or let the 30-minute idle timer enter S5 standby automatically once agents finish.
 
 ### Example Chat Canvas Prompts
 - **4-Socket Sweep:** *"Sync this repo to the mesh and run the full test suite across all sockets in parallel."*
@@ -102,10 +112,11 @@ mesh-acp node2-node0 "Now run benchmarks on the binary." --continue --skip-perms
 git diff HEAD..mesh/node2-node0
 git merge mesh/node2-node0
 
-# Power, sleep, and wake testing
-mesh-power status
-mesh-power wake
-mesh-power sleep
+# Power, sleep, and wake testing (supports targeting individual nodes)
+mesh-power status [host...]
+mesh-power wake [host...]
+mesh-power ensure [host...]
+mesh-power sleep [host...]
 ./scripts/test-sleep-wake.sh
 
 # Cluster storage, $HOME, and package parity hygiene

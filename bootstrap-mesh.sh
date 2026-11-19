@@ -2,9 +2,11 @@
 # bootstrap-mesh.sh: Master Control-Plane & Multi-Node Cluster Orchestrator
 #
 # Deploys the control-plane CLI tools (bin/mesh-{power,sync,acp,hygiene}),
-# generates ~/.config/mesh/cluster.conf, configures SSH ControlMaster multiplexing,
-# registers NUMA ACP subagents in Antigravity settings.json, installs global Lead Agent
-# routing rules (rules/mesh-cluster.md), and provisions remote nodes via provision-node.sh.
+# generates ~/.config/mesh/cluster.conf, configures SSH Host entries (WSL & Windows)
+# compatible with Antigravity "Connect over SSH" (v2.33.0+), registers NUMA ACP
+# subagents in settings.json, installs global Lead Agent routing rules
+# (rules/mesh-cluster.md + node-local rules/mesh-node.md), and provisions remote
+# nodes via provision-node.sh.
 #
 # Usage:
 #   ./bootstrap-mesh.sh [OPTIONS]
@@ -15,6 +17,7 @@
 #   --bcast <ip>                       Subnet broadcast IP for Wake-on-LAN (default: auto from node1 IP /24)
 #   --primary-nic <iface>              Primary WoL NIC on remote nodes (default: auto-detected)
 #   --secondary-nic <iface>            Optional unused secondary NIC to power off (default: none)
+#   --ssh-autowake                     Add Match originalhost WoL auto-wake hook to SSH configs
 #
 # Provisioning Options (forwarded to provision-node.sh):
 #   --with-eda                         Install KiCad 10 + JRE + freerouting.jar on nodes
@@ -29,6 +32,8 @@
 #   --control-plane-only               Configure local workstation only (do not wake/provision nodes)
 #   --provision-nodes                  Stream provision-node.sh to all configured nodes in parallel
 #   --sync-auth                        Copy local ~/.gemini/antigravity-cli auth & start remote daemons
+#   --sync-node-rules                  Install rules/mesh-node.md into ~/.gemini/ on all nodes
+#   --no-node-rules                    Skip installing rules/mesh-node.md on nodes
 #   --reboot-nodes                     Reboot nodes to latch BIOS settings & wait for SSH readiness
 #   --verify                           Run control-plane & multi-socket health audit
 set -euo pipefail
@@ -48,10 +53,13 @@ WITH_EDA=0
 WITH_EMBEDDED=0
 NO_TTS=0
 DELL_BIOS_FLAG=""
+SSH_AUTOWAKE=0
+SKIP_NODE_RULES=0
 
 CONTROL_PLANE_ONLY=0
 DO_PROVISION_NODES=0
 DO_SYNC_AUTH=0
+DO_SYNC_NODE_RULES=0
 DO_REBOOT_NODES=0
 DO_VERIFY=0
 EXPLICIT_ACTION=0
@@ -63,6 +71,7 @@ while [ $# -gt 0 ]; do
     --bcast) BCAST="${2:?Missing value for --bcast}"; shift ;;
     --primary-nic) PRIMARY_NIC="${2:?Missing value for --primary-nic}"; shift ;;
     --secondary-nic) SECONDARY_NIC="${2:?Missing value for --secondary-nic}"; shift ;;
+    --ssh-autowake) SSH_AUTOWAKE=1 ;;
     --idle-minutes) IDLE_LIMIT_MIN="${2:?Missing value for --idle-minutes}"; shift ;;
     --ccache-size) CCACHE_SIZE="${2:?Missing value for --ccache-size}"; shift ;;
     --scratch-disk) SCRATCH_DISK="${2:?Missing value for --scratch-disk}"; shift ;;
@@ -74,10 +83,12 @@ while [ $# -gt 0 ]; do
     --control-plane-only) CONTROL_PLANE_ONLY=1; EXPLICIT_ACTION=1 ;;
     --provision-nodes) DO_PROVISION_NODES=1; EXPLICIT_ACTION=1 ;;
     --sync-auth) DO_SYNC_AUTH=1; EXPLICIT_ACTION=1 ;;
+    --sync-node-rules) DO_SYNC_NODE_RULES=1; EXPLICIT_ACTION=1 ;;
+    --no-node-rules) SKIP_NODE_RULES=1 ;;
     --reboot-nodes) DO_REBOOT_NODES=1; EXPLICIT_ACTION=1 ;;
     --verify|--verify-only) DO_VERIFY=1; EXPLICIT_ACTION=1 ;;
     -h|--help)
-      sed -n '2,33p' "$0" | sed 's/^# \{0,1\}//'
+      sed -n '2,38p' "$0" | sed 's/^# \{0,1\}//'
       exit 0
       ;;
     *)
@@ -105,14 +116,62 @@ run_root() {
   elif sudo -n true 2>/dev/null; then
     sudo "$@"
   elif [ -x /mnt/c/Windows/System32/wsl.exe ] && [ -n "${WSL_DISTRO_NAME:-}" ]; then
-    /mnt/c/Windows/System32/wsl.exe -d "$WSL_DISTRO_NAME" -u root -- "$@"
+    /mnt/c/Windows/System32/wsl.exe -d "$WSL_DISTRO_NAME" -u root -- "$@" < /dev/null
   else
     sudo "$@"
   fi
 }
 
+upsert_ssh_block() {
+  local ssh_cfg="$1"
+  local alias="$2"
+  local block_content="$3"
+  python3 - "$ssh_cfg" "$alias" "$block_content" <<'PYEOF'
+import re, sys
+path, alias, block = sys.argv[1:4]
+try:
+    with open(path, "r", encoding="utf-8") as f:
+        text = f.read()
+except FileNotFoundError:
+    text = ""
+
+# Remove managed block if present
+managed_re = re.compile(
+    rf"\n?# BEGIN antigravity-mesh:{re.escape(alias)}\n.*?# END antigravity-mesh:{re.escape(alias)}\n?",
+    re.S,
+)
+text = managed_re.sub("\n", text)
+
+# Remove legacy unmanaged "Host <alias>" or "Host <alias> <ip>" block if present
+legacy_re = re.compile(
+    rf"(?m)^Host {re.escape(alias)}(?: [0-9.]+)?\r?\n(?:[ \t]+.*\r?\n)*",
+)
+text = legacy_re.sub("", text)
+
+text = text.strip()
+new_text = (text + "\n\n" if text else "") + block.strip() + "\n"
+with open(path, "w", encoding="utf-8", newline="\n") as f:
+    f.write(new_text)
+PYEOF
+}
+
+detect_win_home() {
+  if [ -d /mnt/c/Users ] && [ -x /mnt/c/Windows/System32/cmd.exe ]; then
+    local wp linux_wp
+    wp=$(cd /mnt/c && /mnt/c/Windows/System32/cmd.exe /c "echo %USERPROFILE%" < /dev/null 2>/dev/null | tr -d '\r\n' || true)
+    if [ -n "$wp" ] && command -v wslpath >/dev/null 2>&1; then
+      linux_wp=$(wslpath -u "$wp" 2>/dev/null || true)
+      if [ -n "$linux_wp" ] && [ -d "$linux_wp" ]; then
+        printf '%s' "$linux_wp"
+        return 0
+      fi
+    fi
+  fi
+  return 1
+}
+
 # Verify required repository files
-for req in provision-node.sh bin/mesh-power bin/mesh-sync bin/mesh-acp bin/mesh-hygiene rules/mesh-cluster.md; do
+for req in provision-node.sh bin/mesh-power bin/mesh-sync bin/mesh-acp bin/mesh-hygiene rules/mesh-cluster.md rules/mesh-node.md; do
   if [ ! -f "${SCRIPT_DIR}/${req}" ]; then
     echo "Error: Missing required file ${SCRIPT_DIR}/${req}" >&2
     exit 1
@@ -167,7 +226,7 @@ SCRATCH_DISK="${SCRATCH_DISK:-/dev/sdb}"
 # Stage 1-4: Configure Control Plane
 # ------------------------------------------------------------------------------
 setup_control_plane() {
-  step "Stage 1: Installing Control-Plane Dependencies & SSH Multiplexing"
+  step "Stage 1: Installing Control-Plane Dependencies & SSH Config (WSL & Windows)"
 
   if ! command -v wakeonlan >/dev/null 2>&1 || ! command -v jq >/dev/null 2>&1; then
     run_root env DEBIAN_FRONTEND=noninteractive apt-get update -qq
@@ -176,45 +235,77 @@ setup_control_plane() {
 
   mkdir -p "$HOME/.ssh/controlmasters" "$(dirname "$MESH_CONFIG")"
   chmod 700 "$HOME/.ssh" "$HOME/.ssh/controlmasters"
-  touch "$HOME/.ssh/config"
+  touch "$HOME/.ssh/config" "$HOME/.ssh/known_hosts"
   chmod 600 "$HOME/.ssh/config"
+
+  WIN_HOME=""
+  if WIN_HOME=$(detect_win_home); then
+    mkdir -p "${WIN_HOME}/.ssh"
+    touch "${WIN_HOME}/.ssh/config" "${WIN_HOME}/.ssh/known_hosts"
+  fi
 
   UPDATED_NODES=()
   for entry in "${NODE_SPECS[@]}"; do
     IFS="|" read -r alias ip mac numas persona desc <<< "$entry"
 
-    if ! grep -q "^Host ${alias} " "$HOME/.ssh/config" 2>/dev/null; then
-      cat <<EOF >> "$HOME/.ssh/config"
+    wsl_block="# BEGIN antigravity-mesh:${alias}"$'\n'
+    wsl_block+="Host ${alias}"$'\n'
+    wsl_block+="  HostName ${ip}"$'\n'
+    wsl_block+="  User ${REMOTE_USER}"$'\n'
+    wsl_block+="  ControlMaster auto"$'\n'
+    wsl_block+="  ControlPath ~/.ssh/controlmasters/%r@%h:%p"$'\n'
+    wsl_block+="  ControlPersist 4h"$'\n'
+    wsl_block+="  ServerAliveInterval 30"$'\n'
+    wsl_block+="  ServerAliveCountMax 3"$'\n'
+    if [ "$SSH_AUTOWAKE" -eq 1 ]; then
+      wsl_block+="Match originalhost ${alias} exec \"/usr/local/bin/mesh-power ensure ${alias} >/dev/null 2>&1\""$'\n'
+    fi
+    wsl_block+="# END antigravity-mesh:${alias}"
 
-Host ${alias} ${ip}
-  HostName ${ip}
-  User ${REMOTE_USER}
-  ControlMaster auto
-  ControlPath ~/.ssh/controlmasters/%r@%h:%p
-  ControlPersist 4h
-  ServerAliveInterval 30
-  ServerAliveCountMax 3
-EOF
-      echo "Added 'Host ${alias}' (${ip}) to ~/.ssh/config"
+    upsert_ssh_block "$HOME/.ssh/config" "$alias" "$wsl_block"
+    echo "Updated concrete 'Host ${alias}' (${ip}) in ~/.ssh/config"
+
+    if [ -n "$WIN_HOME" ]; then
+      win_block="# BEGIN antigravity-mesh:${alias}"$'\n'
+      win_block+="Host ${alias}"$'\n'
+      win_block+="  HostName ${ip}"$'\n'
+      win_block+="  User ${REMOTE_USER}"$'\n'
+      win_block+="  ServerAliveInterval 15"$'\n'
+      win_block+="  ServerAliveCountMax 3"$'\n'
+      if [ "$SSH_AUTOWAKE" -eq 1 ]; then
+        win_block+="Match originalhost ${alias} exec \"wsl -d ${WSL_DISTRO_NAME:-Ubuntu} -- /usr/local/bin/mesh-power ensure ${alias} >/dev/null 2>&1\""$'\n'
+      fi
+      win_block+="# END antigravity-mesh:${alias}"
+      upsert_ssh_block "${WIN_HOME}/.ssh/config" "$alias" "$win_block"
+      echo "Updated concrete 'Host ${alias}' (${ip}) in ${WIN_HOME}/.ssh/config"
     fi
 
-    # Auto-discover live MAC, NUMA node count, and CPU summary if reachable
+    # Auto-discover live MAC, host key, NUMA node count, and CPU summary if reachable
     if ping -c 1 -W 1 "$ip" >/dev/null 2>&1; then
+      if command -v ssh-keyscan >/dev/null 2>&1; then
+        hostkey=$(ssh-keyscan -T 2 -t ed25519 "$ip" 2>/dev/null || true)
+        if [ -n "$hostkey" ]; then
+          ssh-keygen -F "$ip" -f "$HOME/.ssh/known_hosts" >/dev/null 2>&1 || printf '%s\n' "$hostkey" >> "$HOME/.ssh/known_hosts"
+          if [ -n "$WIN_HOME" ]; then
+            ssh-keygen -F "$ip" -f "${WIN_HOME}/.ssh/known_hosts" >/dev/null 2>&1 || printf '%s\n' "$hostkey" >> "${WIN_HOME}/.ssh/known_hosts"
+          fi
+        fi
+      fi
       probe_nic="${PRIMARY_NIC}"
       if [ -z "$probe_nic" ]; then
-        probe_nic=$(ssh -o ConnectTimeout=2 "$alias" "ip route show default 2>/dev/null | awk '/default/{for(i=1;i<=NF;i++) if(\$i==\"dev\"){print \$(i+1); exit}}'" 2>/dev/null || true)
+        probe_nic=$(ssh -n -o ConnectTimeout=2 "$alias" "ip route show default 2>/dev/null | awk '/default/{for(i=1;i<=NF;i++) if(\$i==\"dev\"){print \$(i+1); exit}}'" 2>/dev/null || true)
       fi
       if [ -n "$probe_nic" ]; then
-        live_mac=$(ssh -o ConnectTimeout=2 "$alias" "cat /sys/class/net/${probe_nic}/address" 2>/dev/null || true)
+        live_mac=$(ssh -n -o ConnectTimeout=2 "$alias" "cat /sys/class/net/${probe_nic}/address" 2>/dev/null || true)
         [ -n "$live_mac" ] && mac="$live_mac"
       fi
-      live_numas=$(ssh -o ConnectTimeout=2 "$alias" "ls -d /sys/devices/system/node/node[0-9]* 2>/dev/null | wc -l" 2>/dev/null || true)
+      live_numas=$(ssh -n -o ConnectTimeout=2 "$alias" "ls -d /sys/devices/system/node/node[0-9]* 2>/dev/null | wc -l" 2>/dev/null || true)
       if [[ "$live_numas" =~ ^[0-9]+$ ]] && [ "$live_numas" -ge 1 ]; then
         numas="$live_numas"
       fi
-      live_cpu=$(ssh -o ConnectTimeout=2 "$alias" "lscpu | awk -F: '/Model name/{gsub(/^[ \t]+/, \"\", \$2); print \$2; exit}'" 2>/dev/null || true)
-      live_threads=$(ssh -o ConnectTimeout=2 "$alias" "nproc" 2>/dev/null || true)
-      live_ram=$(ssh -o ConnectTimeout=2 "$alias" "awk '/MemTotal/{printf \"%dG\", (\$2+524288)/1048576}' /proc/meminfo" 2>/dev/null || true)
+      live_cpu=$(ssh -n -o ConnectTimeout=2 "$alias" "lscpu | awk -F: '/Model name/{gsub(/^[ \t]+/, \"\", \$2); print \$2; exit}'" 2>/dev/null || true)
+      live_threads=$(ssh -n -o ConnectTimeout=2 "$alias" "nproc" 2>/dev/null || true)
+      live_ram=$(ssh -n -o ConnectTimeout=2 "$alias" "awk '/MemTotal/{printf \"%dG\", (\$2+524288)/1048576}' /proc/meminfo" 2>/dev/null || true)
       if [ -n "$live_cpu" ]; then
         desc="${live_cpu} (${live_threads:-?}T, ${live_ram:-?} RAM)"
       fi
@@ -310,17 +401,11 @@ PYEOF
   cp "$RENDERED_RULE" "$HOME/.gemini/antigravity-cli/rules/mesh-cluster.md"
   echo "Installed rendered mesh-cluster.md into ~/.gemini/ paths."
 
-  if [ -d /mnt/c/Users ]; then
-    WIN_USER=""
-    if [ -x /mnt/c/Windows/System32/cmd.exe ]; then
-      WIN_USER=$(cd /mnt/c && /mnt/c/Windows/System32/cmd.exe /c "echo %USERNAME%" 2>/dev/null | tr -d '\r\n' || true)
-    fi
-    if [ -n "$WIN_USER" ] && [ -d "/mnt/c/Users/${WIN_USER}" ]; then
-      mkdir -p "/mnt/c/Users/${WIN_USER}/.gemini/config/rules"
-      cp "$RENDERED_RULE" "/mnt/c/Users/${WIN_USER}/.gemini/GEMINI.md"
-      cp "$RENDERED_RULE" "/mnt/c/Users/${WIN_USER}/.gemini/config/rules/mesh-cluster.md"
-      echo "Installed rendered mesh-cluster.md into C:\\Users\\${WIN_USER}\\.gemini\\ paths."
-    fi
+  if [ -n "$WIN_HOME" ]; then
+    mkdir -p "${WIN_HOME}/.gemini/config/rules"
+    cp "$RENDERED_RULE" "${WIN_HOME}/.gemini/GEMINI.md"
+    cp "$RENDERED_RULE" "${WIN_HOME}/.gemini/config/rules/mesh-cluster.md"
+    echo "Installed rendered mesh-cluster.md into ${WIN_HOME}/.gemini/ paths."
   fi
   rm -f "$RENDERED_RULE"
 }
@@ -353,6 +438,20 @@ provision_remote_nodes() {
 }
 
 # ------------------------------------------------------------------------------
+# Stage 5b: Install Node-Local Rules (~/.gemini/) for Connect-over-SSH Sessions
+# ------------------------------------------------------------------------------
+sync_node_rules() {
+  step "Installing Node-Local Rules (rules/mesh-node.md) into Remote ~/.gemini/"
+  /usr/local/bin/mesh-power ensure
+
+  for entry in "${NODE_SPECS[@]}"; do
+    IFS="|" read -r alias _ip _mac _numas _persona _desc <<< "$entry"
+    ssh -T "$alias" "mkdir -p \$HOME/.gemini/config/rules && cat > \$HOME/.gemini/config/rules/mesh-node.md && cp \$HOME/.gemini/config/rules/mesh-node.md \$HOME/.gemini/GEMINI.md" < "${SCRIPT_DIR}/rules/mesh-node.md"
+    echo "[${alias}] Installed ~/.gemini/GEMINI.md and ~/.gemini/config/rules/mesh-node.md"
+  done
+}
+
+# ------------------------------------------------------------------------------
 # Stage 6: Sync Antigravity OAuth Credentials & Enable Remote Control Daemon
 # ------------------------------------------------------------------------------
 sync_remote_auth() {
@@ -362,9 +461,9 @@ sync_remote_auth() {
   for entry in "${NODE_SPECS[@]}"; do
     IFS="|" read -r alias _ip _mac _numas _persona _desc <<< "$entry"
     if [ -d "$HOME/.gemini/antigravity-cli" ]; then
-      tar -C "$HOME" -cf - .gemini/antigravity-cli 2>/dev/null | ssh -T "$alias" "tar -C \$HOME -xf -" || true
+      tar -C "$HOME" -cf - .gemini/antigravity-cli 2>/dev/null | ssh -T "$alias" "mkdir -p \$HOME/.gemini && tar -C \$HOME -xf -" || true
     fi
-    ssh -T "$alias" "
+    ssh -n -T "$alias" "
       export PATH=\"\$HOME/.local/bin:\$PATH\"
       sudo loginctl enable-linger \"\$(id -un)\"
       agy remote-control start --name '$alias' 2>/dev/null || true
@@ -382,7 +481,7 @@ reboot_nodes() {
   step "Stage 7: Rebooting Cluster Nodes to Latch BIOS Settings"
   for entry in "${NODE_SPECS[@]}"; do
     IFS="|" read -r alias _ip _mac _numas _persona _desc <<< "$entry"
-    ssh -o ConnectTimeout=5 "$alias" "sudo reboot" 2>/dev/null || true
+    ssh -n -o ConnectTimeout=5 "$alias" "sudo reboot" 2>/dev/null || true
     ssh -O exit "$alias" 2>/dev/null || true
   done
   echo "Waiting 15s for nodes to enter POST..."
@@ -413,14 +512,16 @@ verify_cluster() {
   done
 
   if [ "$all_up" -eq 1 ]; then
-    echo "=== 4. Remote Node Storage, Caches & Binaries ==="
+    echo "=== 4. Remote Node Storage, Caches, SSH Forwarding & Binaries ==="
     for entry in "${NODE_SPECS[@]}"; do
       IFS="|" read -r alias _ip _mac _numas _persona _desc <<< "$entry"
-      ssh -T "$alias" "
-        printf '[%-10s] /opt/mesh free: %s | ccache: %s | binaries: %s\n' \
+      ssh -n -T "$alias" "
+        printf '[%-10s] /opt/mesh free: %s | ccache: %s | tcp_fwd: %s | env.sh: %s | binaries: %s\n' \
           '$alias' \
           \"\$(df -h /opt/mesh | awk 'NR==2{print \$4}')\" \
           \"\$(CCACHE_DIR=/opt/mesh/cache/ccache ccache -s | awk '/Cache size/{print \$4, \$5, \$6}')\" \
+          \"\$(sudo sshd -T 2>/dev/null | awk '/^allowtcpforwarding /{print \$2; exit}' || echo '?')\" \
+          \"\$([ -f \$HOME/.config/mesh/env.sh ] && echo ok || echo missing)\" \
           \"\$(ls /usr/local/bin/ag-numa-exec /usr/local/bin/ag-acp-worker /usr/local/bin/ag-mesh-worktree /usr/local/bin/ag-idle-watchdog 2>/dev/null | wc -l)/4 core ok\"
       "
     done
@@ -454,6 +555,9 @@ if [ "$CONTROL_PLANE_ONLY" -eq 1 ]; then
 fi
 
 [ "$DO_PROVISION_NODES" -eq 1 ] && provision_remote_nodes
+if [ "$SKIP_NODE_RULES" -eq 0 ] && { [ "$DO_PROVISION_NODES" -eq 1 ] || [ "$DO_SYNC_NODE_RULES" -eq 1 ] || [ "$DO_SYNC_AUTH" -eq 1 ]; }; then
+  sync_node_rules
+fi
 [ "$DO_SYNC_AUTH" -eq 1 ] && sync_remote_auth
 [ "$DO_REBOOT_NODES" -eq 1 ] && reboot_nodes
 [ "$DO_VERIFY" -eq 1 ] && verify_cluster

@@ -25,13 +25,13 @@ for entry in "${MESH_NODES[@]}"; do
   HOSTS+=("$_name")
 done
 
-ALLOWED_HOME_REGEX='^(\.bash_history|\.bash_logout|\.bashrc|\.cache|\.config|\.gemini|\.local|\.npm|\.profile|\.ssh|\.sudo_as_admin_successful|tools)$'
+ALLOWED_HOME_REGEX='^(\.antigravity-hub-server|\.bash_history|\.bash_logout|\.bash_profile|\.bashrc|\.cache|\.config|\.gemini|\.gitconfig|\.lesshst|\.local|\.npm|\.profile|\.ssh|\.sudo_as_admin_successful|\.wget-hsts|\.zprofile|\.zshrc|tools)$'
 
 if [ -x /usr/local/bin/mesh-power ]; then
   /usr/local/bin/mesh-power ensure
 fi
 for h in "${HOSTS[@]}"; do
-  ssh -T "$h" "echo 0 > /run/ag-idle-minutes 2>/dev/null || true" &
+  ssh -n -T "$h" "echo 0 > /run/ag-idle-minutes 2>/dev/null || true" &
 done
 wait
 
@@ -51,7 +51,7 @@ case "$cmd" in
       echo "======================================================================"
       echo "=== 2. Node Hygiene Audit: ${host} ==="
       echo "======================================================================"
-      ssh -T "$host" "
+      ssh -n -T "$host" "
         set -euo pipefail
         USER_NAME=\$(id -un)
         USER_HOME=\"\$HOME\"
@@ -94,11 +94,11 @@ case "$cmd" in
       echo "=== 3. Cross-Node Package Parity (vs ${HOSTS[0]}) ==="
       echo "======================================================================"
       base_host="${HOSTS[0]}"
-      base_pkgs=$(ssh -T "$base_host" "apt-mark showmanual | sort")
+      base_pkgs=$(ssh -n -T "$base_host" "apt-mark showmanual | sort")
       for idx in "${!HOSTS[@]}"; do
         [ "$idx" -eq 0 ] && continue
         peer="${HOSTS[$idx]}"
-        diff_out=$(diff -u <(printf '%s\n' "$base_pkgs") <(ssh -T "$peer" "apt-mark showmanual | sort") || true)
+        diff_out=$(diff -u <(printf '%s\n' "$base_pkgs") <(ssh -n -T "$peer" "apt-mark showmanual | sort") || true)
         if [ -z "$diff_out" ]; then
           echo "  [OK] ${base_host} and ${peer} have 100% identical manual APT package sets."
         else
@@ -112,7 +112,7 @@ case "$cmd" in
   clean)
     for host in "${HOSTS[@]}"; do
       echo "=== Cleaning stray \$HOME files, /tmp, and APT cache on ${host} ==="
-      ssh -T "$host" "
+      ssh -n -T "$host" "
         set -euo pipefail
         USER_NAME=\$(id -un)
         USER_HOME=\"\$HOME\"
@@ -153,15 +153,15 @@ case "$cmd" in
 
   freeze-packages)
     for host in "${HOSTS[@]}"; do
-      ssh -T "$host" "apt-mark showmanual | sort | sudo tee /etc/ag-baseline-packages.list >/dev/null && sudo chmod 0644 /etc/ag-baseline-packages.list"
-      echo "[${host}] Saved $(ssh -T "$host" "wc -l < /etc/ag-baseline-packages.list") packages to /etc/ag-baseline-packages.list"
+      ssh -n -T "$host" "apt-mark showmanual | sort | sudo tee /etc/ag-baseline-packages.list >/dev/null && sudo chmod 0644 /etc/ag-baseline-packages.list"
+      echo "[${host}] Saved $(ssh -n -T "$host" "wc -l < /etc/ag-baseline-packages.list") packages to /etc/ag-baseline-packages.list"
     done
     ;;
 
   reset-packages)
     for host in "${HOSTS[@]}"; do
       echo "=== Resetting ad-hoc APT packages on ${host} to /etc/ag-baseline-packages.list ==="
-      ssh -T "$host" '
+      ssh -n -T "$host" '
         set -euo pipefail
         if [ ! -f /etc/ag-baseline-packages.list ]; then
           echo "No /etc/ag-baseline-packages.list found on $(hostname); skipping."
@@ -183,7 +183,7 @@ case "$cmd" in
   prune-caches)
     for host in "${HOSTS[@]}"; do
       echo "=== Pruning caches on ${host} ==="
-      ssh -T "$host" "
+      ssh -n -T "$host" "
         CCACHE_DIR=/opt/mesh/cache/ccache ccache -c >/dev/null 2>&1 || true
         rm -rf /opt/mesh/cache/pip/* /opt/mesh/cache/npm/* /opt/mesh/cache/xdg-cache/* 2>/dev/null || true
         df -h /opt/mesh

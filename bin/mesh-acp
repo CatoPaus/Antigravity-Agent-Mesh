@@ -345,8 +345,9 @@ async def main():
     targets = resolve_targets(args.target, all_targets, hosts)
     auto_project = None if (args.no_project or args.subpath is not None) else detect_git_project()
 
+    target_hosts = list(dict.fromkeys(t.rsplit("-node", 1)[0] for t in targets))
     if os.path.exists("/usr/local/bin/mesh-power"):
-        subprocess.run(["/usr/local/bin/mesh-power", "ensure"], check=True)
+        subprocess.run(["/usr/local/bin/mesh-power", "ensure", *target_hosts], check=True)
 
     if args.sync:
         sync_cmd = ["/usr/local/bin/mesh-sync", "push"]

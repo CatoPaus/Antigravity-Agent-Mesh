@@ -1,6 +1,12 @@
 #!/usr/bin/env bash
 # mesh-power: Cluster Wake-on-LAN, S5 sleep, readiness check, and chassis TTS controller
-# Usage: mesh-power <status|wake|sleep|ensure|notify|say> [args...]
+# Usage:
+#   mesh-power status [host...]
+#   mesh-power wake   [host...]
+#   mesh-power sleep  [host...]
+#   mesh-power ensure [host...]
+#   mesh-power notify <online|offline|input|done> [message...]
+#   mesh-power say    <message...>
 set -euo pipefail
 
 MESH_CONFIG="${MESH_CONFIG:-${HOME}/.config/mesh/cluster.conf}"
@@ -26,26 +32,60 @@ for entry in "${MESH_NODES[@]}"; do
   NODE_MACS+=("$_mac")
 done
 
+resolve_indices() {
+  local -n _out=$1
+  shift
+  _out=()
+  if [ $# -eq 0 ]; then
+    for idx in "${!NODE_NAMES[@]}"; do
+      _out+=("$idx")
+    done
+    return 0
+  fi
+  for target in "$@"; do
+    local found=0
+    for idx in "${!NODE_NAMES[@]}"; do
+      if [ "${NODE_NAMES[$idx]}" = "$target" ] || [ "${NODE_IPS[$idx]}" = "$target" ]; then
+        _out+=("$idx")
+        found=1
+        break
+      fi
+    done
+    if [ "$found" -eq 0 ]; then
+      echo "Error: Unknown node '$target'. Configured nodes: ${NODE_NAMES[*]}" >&2
+      return 1
+    fi
+  done
+}
+
 all_online() {
-  for ip in "${NODE_IPS[@]}"; do
-    ping -c 1 -W 1 "$ip" >/dev/null 2>&1 || return 1
+  local idx
+  for idx in "$@"; do
+    ping -c 1 -W 1 "${NODE_IPS[$idx]}" >/dev/null 2>&1 || return 1
   done
   return 0
 }
 
-case "${1:-status}" in
+ACTION="${1:-status}"
+[ $# -gt 0 ] && shift
+
+case "$ACTION" in
   wake)
-    echo "Sending Wake-on-LAN Magic Packets (${NODE_NAMES[*]})..."
+    resolve_indices TARGET_INDICES "$@"
+    target_names=()
     valid_macs=()
-    for mac in "${NODE_MACS[@]}"; do
+    for idx in "${TARGET_INDICES[@]}"; do
+      target_names+=("${NODE_NAMES[$idx]}")
+      mac="${NODE_MACS[$idx]}"
       if [ -n "$mac" ] && [ "$mac" != "00:00:00:00:00:00" ]; then
         valid_macs+=("$mac")
       fi
     done
     if [ "${#valid_macs[@]}" -eq 0 ]; then
-      echo "Error: No valid MAC addresses configured in ${MESH_CONFIG}." >&2
+      echo "Error: No valid MAC addresses configured for (${target_names[*]}) in ${MESH_CONFIG}." >&2
       exit 1
     fi
+    echo "Sending Wake-on-LAN Magic Packets (${target_names[*]})..."
     if command -v wakeonlan >/dev/null 2>&1; then
       wakeonlan -i "$MESH_BCAST" "${valid_macs[@]}"
     fi
@@ -63,58 +103,69 @@ case "${1:-status}" in
       " >/dev/null 2>&1 || true
     fi
     ;;
+
   sleep)
+    resolve_indices TARGET_INDICES "$@"
     CALLER="${AG_CALLER:-$(whoami)}"
-    echo "Powering down cluster nodes (${NODE_NAMES[*]}) into S5 WoL standby..."
-    for name in "${NODE_NAMES[@]}"; do
+    target_names=()
+    for idx in "${TARGET_INDICES[@]}"; do
+      target_names+=("${NODE_NAMES[$idx]}")
+    done
+    echo "Powering down cluster nodes (${target_names[*]}) into S5 WoL standby..."
+    for name in "${target_names[@]}"; do
       (
-        ssh -o ConnectTimeout=3 "$name" "AG_CALLER=$(printf '%q' "$CALLER") /usr/local/bin/ag-notify offline 2>/dev/null || true; sudo poweroff" 2>/dev/null || true
+        ssh -n -o ConnectTimeout=3 "$name" "AG_CALLER=$(printf '%q' "$CALLER") /usr/local/bin/ag-notify offline 2>/dev/null || true; sudo poweroff" 2>/dev/null || true
         ssh -O exit "$name" 2>/dev/null || true
       ) &
     done
     wait
     echo "Shutdown signal dispatched."
     ;;
+
   notify|say)
-    ACTION_KIND="${1}"
     CALLER="${AG_CALLER:-$(whoami)}"
-    shift || true
-    if [ "$ACTION_KIND" = "say" ]; then
+    if [ "$ACTION" = "say" ]; then
       ARGS=(say "$*")
     else
       ARGS=("$@")
     fi
     REMOTE_ARGS=$(printf '%q ' "${ARGS[@]}")
     for name in "${NODE_NAMES[@]}"; do
-      ssh -o ConnectTimeout=2 "$name" "if [ -x /usr/local/bin/ag-notify ]; then AG_CALLER=$(printf '%q' "$CALLER") /usr/local/bin/ag-notify ${REMOTE_ARGS}; fi" 2>/dev/null &
+      ssh -n -o ConnectTimeout=2 "$name" "if [ -x /usr/local/bin/ag-notify ]; then AG_CALLER=$(printf '%q' "$CALLER") /usr/local/bin/ag-notify ${REMOTE_ARGS}; fi" 2>/dev/null &
     done
     wait
     ;;
+
   status)
-    for idx in "${!NODE_NAMES[@]}"; do
+    resolve_indices TARGET_INDICES "$@"
+    for idx in "${TARGET_INDICES[@]}"; do
       name="${NODE_NAMES[$idx]}"
       ip="${NODE_IPS[$idx]}"
       mac="${NODE_MACS[$idx]}"
       if ping -c 1 -W 1 "$ip" >/dev/null 2>&1; then
-        load=$(ssh -o ConnectTimeout=2 "$name" "printf '%s | Idle: %sm/${MESH_IDLE_MINUTES}m' \"\$(cut -d' ' -f1-3 /proc/loadavg)\" \"\$(cat /run/ag-idle-minutes 2>/dev/null || echo 0)\"" 2>/dev/null || echo "booting...")
+        load=$(ssh -n -o ConnectTimeout=2 "$name" "printf '%s | Idle: %sm/${MESH_IDLE_MINUTES}m' \"\$(cut -d' ' -f1-3 /proc/loadavg)\" \"\$(cat /run/ag-idle-minutes 2>/dev/null || echo 0)\"" 2>/dev/null || echo "booting...")
         printf "[%-10s] %-15s | MAC: %s | STATE: ONLINE  (Load: %s)\n" "$name" "$ip" "$mac" "$load"
       else
         printf "[%-10s] %-15s | MAC: %s | STATE: OFFLINE (S5 Standby)\n" "$name" "$ip" "$mac"
       fi
     done
     ;;
+
   ensure)
-    if ! all_online; then
-      echo "[mesh-power] One or more cluster nodes offline. Triggering Wake-on-LAN..." >&2
-      for name in "${NODE_NAMES[@]}"; do
-        ssh -O exit "$name" 2>/dev/null || true
+    resolve_indices TARGET_INDICES "$@"
+    if ! all_online "${TARGET_INDICES[@]}"; then
+      target_names=()
+      for idx in "${TARGET_INDICES[@]}"; do
+        target_names+=("${NODE_NAMES[$idx]}")
+        ssh -O exit "${NODE_NAMES[$idx]}" 2>/dev/null || true
       done
-      "$0" wake >&2
-      echo -n "[mesh-power] Waiting for SSH readiness (${NODE_NAMES[*]})" >&2
+      echo "[mesh-power] Target node(s) offline (${target_names[*]}). Triggering Wake-on-LAN..." >&2
+      "$0" wake "${target_names[@]}" >&2
+      echo -n "[mesh-power] Waiting for SSH readiness (${target_names[*]})" >&2
       for _ in $(seq 1 60); do
         ready=1
-        for name in "${NODE_NAMES[@]}"; do
-          if ! ssh -o ConnectTimeout=2 "$name" "true" 2>/dev/null; then
+        for name in "${target_names[@]}"; do
+          if ! ssh -n -o ConnectTimeout=2 "$name" "true" 2>/dev/null; then
             ready=0
             break
           fi
@@ -130,8 +181,9 @@ case "${1:-status}" in
       exit 1
     fi
     ;;
+
   *)
-    echo "Usage: mesh-power {status|wake|sleep|ensure|notify|say}"
+    echo "Usage: mesh-power {status|wake|sleep|ensure|notify|say} [args...]" >&2
     exit 1
     ;;
 esac

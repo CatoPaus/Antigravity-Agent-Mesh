@@ -117,7 +117,8 @@ Antigravity-Agent-Mesh/
 ├── config/
 │   └── cluster.conf.example   # Reference cluster configuration template
 ├── rules/
-│   └── mesh-cluster.md        # Global Antigravity 2.0 Lead Agent routing rule template
+│   ├── mesh-cluster.md        # Local Lead Agent routing rule template
+│   └── mesh-node.md           # Node-local rule for (SSH: <host>) sessions
 ├── scripts/
 │   ├── probe-node.sh          # CPU, NUMA, memory, disk, PCIe, and NIC discovery probe
 │   └── test-sleep-wake.sh     # End-to-end S5 sleep & Wake-on-LAN benchmark test

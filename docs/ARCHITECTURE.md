@@ -19,8 +19,9 @@ On multi-socket Xeon systems, cross-socket QPI memory access adds latency and ha
 
 ## 2. ACP Stdio Worker Entrypoint (`ag-acp-worker` & `mesh-acp`)
 
-### Preserving Environment Across `sudo`
-Because `ag-numa-exec` invokes `sudo systemd-run`, `sudo`'s `env_reset` and `secure_path` strip caller environment variables (`PATH`, `HOME`, `NO_COLOR`, `TERM`, `CCACHE_*`). `/usr/local/bin/ag-acp-worker` executes `ag-numa-exec` with an explicit `env` wrapper:
+### Preserving Environment Across `sudo` & `$SHELL -l -i`
+1. **Remote interactive & Connect-over-SSH shells (`~/.config/mesh/env.sh`):** Antigravity App **Connect over SSH** (`v2.33.0+`) resolves shell variables via `$SHELL -l -i` (10s timeout, `ANTIGRAVITY_RESOLVING_ENVIRONMENT=1`) and requires silent non-interactive startup plus `AllowTcpForwarding yes` (`/etc/ssh/sshd_config.d/90-antigravity-mesh.conf`). `provision-node.sh` writes `~/.config/mesh/env.sh`—pure, zero-stdout exports for `~/.local/bin`, `/usr/lib/ccache`, `/opt/mesh/cache/cargo/bin`, `CCACHE_*`, `CARGO_HOME`, `PIP_CACHE_DIR`, `npm_config_cache`, `BR2_DL_DIR`, and `MAKEFLAGS`—and sources it from `~/.profile`, `~/.bashrc`, and `~/.zprofile` (when present).
+2. **ACP subagents (`ag-numa-exec` + `sudo`):** Because `ag-numa-exec` invokes `sudo systemd-run`, `sudo`'s `env_reset` and `secure_path` strip caller environment variables. `/usr/local/bin/ag-acp-worker` explicitly wraps the command in `env` inside `antigravity.slice`:
 
 ```text
 mesh-acp (WSL/Linux asyncio)
@@ -66,14 +67,15 @@ Alongside `ccache`, `BR2_DL_DIR`, `CARGO_HOME`, `npm_config_cache`, and `PIP_CAC
 
 ## 5. Wake-on-LAN & Idle S5 Standby (`mesh-power` & `ag-idle-watchdog`)
 
-- **Auto-Wake (`mesh-power ensure`):** Performs a 1-packet ICMP ping check (`~8 ms` when awake). If any configured node is offline, it clears stale SSH `ControlMaster` sockets (`ssh -O exit`), broadcasts UDP Magic Packets (via `wakeonlan` and Windows PowerShell `UdpClient` on WSL), and polls SSH readiness.
+- **Auto-Wake (`mesh-power ensure [host...]`):** Performs a 1-packet ICMP ping check (`~8 ms` when awake) against all nodes or the specified host(s). If any target node is offline, it clears stale SSH `ControlMaster` sockets (`ssh -O exit`), broadcasts UDP Magic Packets (via `wakeonlan` and Windows PowerShell `UdpClient` on WSL), and polls SSH readiness.
 - **Idle Watchdog (`ag-idle-watchdog.timer`):** Runs every 60 seconds and writes to `tmpfs` (`/run/ag-idle-minutes`, pre-created by `systemd-tmpfiles` to satisfy `fs.protected_regular=2`). It resets the counter to `0` if **any** of the following are active:
   1. Tasks inside `/sys/fs/cgroup/antigravity.slice/run-*.scope/cgroup.procs`
   2. Active worker/compiler processes (`ag-acp-worker`, `agy acp|chat|run|agent`, `ccache`, `gcc`, `clang`, `cargo`, `ninja`, `make`, `pytest`, Remote-SSH IDE servers)
   3. Interactive `agy` CLI processes or active children of `agy remote-control serve`
-  4. Interactive SSH PTYs (`who`)
-  5. Non-ControlMaster `sshd`/`sshd-session` child processes
-  6. 1-minute load average above the scaled CPU threshold
+  4. Active **Connect over SSH** (`~/.antigravity-hub-server/`) sessions — resets only while recent hub/brain logs (`-mmin -5`) or non-hub child agent/terminal processes are active, allowing a dormant server with no running agents to sleep after `IDLE_LIMIT_MIN`
+  5. Interactive SSH PTYs (`who`)
+  6. Non-ControlMaster `sshd`/`sshd-session` child processes (including live `(SSH: <host>)` App tunnels)
+  7. 1-minute load average above the scaled CPU threshold
 
 Once the counter reaches `IDLE_LIMIT_MIN` (default `30`), the node logs to `journald`, plays `ag-notify offline`, and runs `systemctl poweroff` into S5 standby.
 

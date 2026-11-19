@@ -167,7 +167,7 @@ fi
 if [ "$WITH_EDA" -eq 1 ]; then
   log "Adding KiCad 10 PPA & EDA packages (--with-eda)..."
   CODENAME=$(. /etc/os-release && echo "${VERSION_CODENAME:-noble}")
-  if ! grep -rq "kicad-10_0-releases" /etc/apt/sources.list /etc/apt/sources.list.d/ 2>/dev/null; then
+  if ! grep -rqE "kicad-10[._]0-releases" /etc/apt/sources.list /etc/apt/sources.list.d/ 2>/dev/null; then
     sudo DEBIAN_FRONTEND=noninteractive apt-get update -qq
     sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq software-properties-common
     sudo add-apt-repository -y ppa:kicad/kicad-10.0-releases || log "Warning: KiCad 10 PPA skipped for codename ${CODENAME}."
@@ -250,9 +250,21 @@ else
 fi
 
 # ==============================================================================
-# [4/9] Boot Tuning, Netplan Wake-on-LAN, Secondary NIC Off & CPU Governor
+# [4/9] SSH Forwarding, Boot Tuning, Netplan WoL, Secondary NIC Off & CPU Governor
 # ==============================================================================
-log "[4/9] Configuring Wake-on-LAN (${PRIMARY_NIC}), service debloat, and performance CPU governor..."
+log "[4/9] Configuring SSH TCP forwarding, Wake-on-LAN (${PRIMARY_NIC}), service debloat, and performance CPU governor..."
+
+sudo mkdir -p /etc/ssh/sshd_config.d
+sudo tee /etc/ssh/sshd_config.d/90-antigravity-mesh.conf >/dev/null <<'EOF'
+# Required by Antigravity App "Connect over SSH" (v2.33.0+)
+AllowTcpForwarding yes
+EOF
+if sudo sshd -t 2>/dev/null; then
+  sudo systemctl reload ssh 2>/dev/null || sudo systemctl reload sshd 2>/dev/null || true
+else
+  log "WARNING: sshd -t rejected 90-antigravity-mesh.conf; removing drop-in."
+  sudo rm -f /etc/ssh/sshd_config.d/90-antigravity-mesh.conf
+fi
 
 if [ "$RUN_DELL_BIOS" -eq 1 ] && [ -f /etc/default/grub ]; then
   sudo sed -i 's/^GRUB_CMDLINE_LINUX_DEFAULT=.*/GRUB_CMDLINE_LINUX_DEFAULT="8250.nr_uarts=0"/' /etc/default/grub
@@ -545,6 +557,42 @@ sudo chown -R "${TARGET_USER}:${TARGET_USER}" /opt/mesh "${USER_HOME}"
 apt-mark showmanual | sort | sudo tee /etc/ag-baseline-packages.list >/dev/null
 sudo chmod 0644 /etc/ag-baseline-packages.list
 
+mkdir -p "${USER_HOME}/.config/mesh"
+cat <<EOF > "${USER_HOME}/.config/mesh/env.sh"
+# Antigravity Agent Mesh shared environment (fast & silent for \$SHELL -l -i)
+case ":\${PATH}:" in
+  *":\${HOME}/.local/bin:"*) ;;
+  *) export PATH="\${HOME}/.local/bin:\${PATH}" ;;
+esac
+case ":\${PATH}:" in
+  *":/opt/mesh/cache/cargo/bin:"*) ;;
+  *) export PATH="/opt/mesh/cache/cargo/bin:\${PATH}" ;;
+esac
+if [ -d /usr/lib/ccache ]; then
+  case ":\${PATH}:" in
+    *":/usr/lib/ccache:"*) ;;
+    *) export PATH="/usr/lib/ccache:\${PATH}" ;;
+  esac
+fi
+export CCACHE_DIR="/opt/mesh/cache/ccache"
+export CCACHE_NOHASHDIR=1
+export CCACHE_SLOPPINESS="file_macro,time_macros"
+export BR2_DL_DIR="/opt/mesh/cache/buildroot-dl"
+export CARGO_HOME="/opt/mesh/cache/cargo"
+export npm_config_cache="/opt/mesh/cache/npm"
+export PIP_CACHE_DIR="/opt/mesh/cache/pip"
+export MAKEFLAGS="-j${MAKE_JOBS}"
+export CMAKE_BUILD_PARALLEL_LEVEL="${MAKE_JOBS}"
+EOF
+chown "${TARGET_USER}:${TARGET_USER}" "${USER_HOME}/.config/mesh/env.sh"
+
+ENV_SOURCE_LINE='[ -f "$HOME/.config/mesh/env.sh" ] && . "$HOME/.config/mesh/env.sh"'
+grep -qxF "$ENV_SOURCE_LINE" "${USER_HOME}/.profile" 2>/dev/null || echo "$ENV_SOURCE_LINE" >> "${USER_HOME}/.profile"
+grep -qxF "$ENV_SOURCE_LINE" "${USER_HOME}/.bashrc" 2>/dev/null || echo "$ENV_SOURCE_LINE" >> "${USER_HOME}/.bashrc"
+if command -v zsh >/dev/null 2>&1 || [ -f "${USER_HOME}/.zprofile" ]; then
+  grep -qxF "$ENV_SOURCE_LINE" "${USER_HOME}/.zprofile" 2>/dev/null || echo "$ENV_SOURCE_LINE" >> "${USER_HOME}/.zprofile"
+fi
+
 sudo tee /usr/local/bin/ag-acp-worker >/dev/null <<EOF
 #!/usr/bin/env bash
 # Generic ACP stdio worker entrypoint with NUMA pinning + shared SSD build caches
@@ -691,6 +739,23 @@ for agy_pid in \$(pgrep -x "agy" 2>/dev/null || true); do
   fi
 done
 
+# 3b. Active Connect-over-SSH (~/.antigravity-hub-server) agents or recent log activity
+if pgrep -u ${TARGET_USER} -f "\\.antigravity-hub-server" >/dev/null 2>&1; then
+  if find "${USER_HOME}/.antigravity-hub-server/data" "${USER_HOME}/.gemini/antigravity/brain" -maxdepth 4 -type f -mmin -5 2>/dev/null | grep -q .; then
+    echo 0 > "\$STATE_FILE"
+    exit 0
+  fi
+  for hub_pid in \$(pgrep -u ${TARGET_USER} -f "\\.antigravity-hub-server" 2>/dev/null || true); do
+    for child_pid in \$(pgrep -P "\$hub_pid" 2>/dev/null || true); do
+      child_cmd=\$(tr '\\0' ' ' < "/proc/\$child_pid/cmdline" 2>/dev/null || true)
+      if [[ "\$child_cmd" != *".antigravity-hub-server"* ]]; then
+        echo 0 > "\$STATE_FILE"
+        exit 0
+      fi
+    done
+  done
+fi
+
 # 4. Interactive SSH PTY sessions (utmp)
 if [ "\$(who | wc -l)" -gt 0 ]; then
   echo 0 > "\$STATE_FILE"
@@ -768,8 +833,6 @@ else
   "${USER_HOME}/.local/bin/agy" update 2>/dev/null || true
 fi
 
-grep -qxF 'export PATH="$HOME/.local/bin:$PATH"' "${USER_HOME}/.bashrc" 2>/dev/null || echo 'export PATH="$HOME/.local/bin:$PATH"' >> "${USER_HOME}/.bashrc"
-grep -qxF 'export PATH="$HOME/.local/bin:$PATH"' "${USER_HOME}/.profile" 2>/dev/null || echo 'export PATH="$HOME/.local/bin:$PATH"' >> "${USER_HOME}/.profile"
 export PATH="${USER_HOME}/.local/bin:$PATH"
 sudo ln -sf "${USER_HOME}/.local/bin/agy" /usr/local/bin/agy
 
