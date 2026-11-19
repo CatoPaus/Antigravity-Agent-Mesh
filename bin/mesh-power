@@ -9,6 +9,11 @@
 #   mesh-power say    <message...>
 set -euo pipefail
 
+if [ "${1:-}" = "ensure" ] && [ "${MESH_POWER_INNER:-0}" = "1" ]; then
+  exit 0
+fi
+export MESH_POWER_INNER=1
+
 MESH_CONFIG="${MESH_CONFIG:-${HOME}/.config/mesh/cluster.conf}"
 if [ -f "$MESH_CONFIG" ]; then
   # shellcheck disable=SC1090

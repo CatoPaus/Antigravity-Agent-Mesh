@@ -129,7 +129,7 @@ case "$ACTION" in
     pids=()
     for host in "${NODE_NAMES[@]}"; do
       (
-        ssh -n -T "$host" "echo 0 > /run/ag-idle-minutes 2>/dev/null || true; mkdir -p '/opt/mesh/repos/${PROJECT}.git' && [ -d '/opt/mesh/repos/${PROJECT}.git/objects' ] || git init --bare --initial-branch=main '/opt/mesh/repos/${PROJECT}.git' >/dev/null"
+        ssh -n -T "$host" "[ -w /run/ag-idle-minutes ] && echo 0 > /run/ag-idle-minutes 2>/dev/null || true; mkdir -p '/opt/mesh/repos/${PROJECT}.git' && [ -d '/opt/mesh/repos/${PROJECT}.git/objects' ] || git init --bare --initial-branch=main '/opt/mesh/repos/${PROJECT}.git' >/dev/null"
         git push --quiet --force "ssh://${host}/opt/mesh/repos/${PROJECT}.git" "${SYNC_REV}:refs/heads/mesh-sync"
         ssh -n -T "$host" "/usr/local/bin/ag-mesh-worktree '$PROJECT' refs/heads/mesh-sync $PRESERVE_FLAG"
       ) &

@@ -25,13 +25,13 @@ for entry in "${MESH_NODES[@]}"; do
   HOSTS+=("$_name")
 done
 
-ALLOWED_HOME_REGEX='^(\.antigravity-hub-server|\.bash_history|\.bash_logout|\.bash_profile|\.bashrc|\.cache|\.config|\.gemini|\.gitconfig|\.lesshst|\.local|\.npm|\.profile|\.ssh|\.sudo_as_admin_successful|\.wget-hsts|\.zprofile|\.zshrc|tools)$'
+ALLOWED_HOME_REGEX='^(\.antigravity-hub-server|\.bash_history|\.bash_logout|\.bash_profile|\.bashrc|\.cache|\.config|\.gemini|\.gitconfig|\.lesshst|\.local|\.npm|\.profile|\.ssh|\.sudo_as_admin_successful|\.wget-hsts|\.zprofile|\.zshrc|Desktop|Documents|Downloads|Music|Pictures|Public|Templates|Videos|snap|tools)$'
 
 if [ -x /usr/local/bin/mesh-power ]; then
   /usr/local/bin/mesh-power ensure
 fi
 for h in "${HOSTS[@]}"; do
-  ssh -n -T "$h" "echo 0 > /run/ag-idle-minutes 2>/dev/null || true" &
+  ssh -n -T "$h" "[ -w /run/ag-idle-minutes ] && echo 0 > /run/ag-idle-minutes 2>/dev/null || true" &
 done
 wait
 
@@ -74,8 +74,8 @@ case "$cmd" in
 
         echo '--- Package Drift vs /etc/ag-baseline-packages.list ---'
         if [ -f /etc/ag-baseline-packages.list ]; then
-          extra=\$(comm -13 /etc/ag-baseline-packages.list <(apt-mark showmanual | sort) || true)
-          missing=\$(comm -23 /etc/ag-baseline-packages.list <(apt-mark showmanual | sort) || true)
+          extra=\$(LC_ALL=C comm -13 <(LC_ALL=C sort /etc/ag-baseline-packages.list) <(apt-mark showmanual | LC_ALL=C sort) || true)
+          missing=\$(LC_ALL=C comm -23 <(LC_ALL=C sort /etc/ag-baseline-packages.list) <(apt-mark showmanual | LC_ALL=C sort) || true)
           if [ -z \"\$extra\" ] && [ -z \"\$missing\" ]; then
             echo \"  [OK] 0 package drift (\$(wc -l < /etc/ag-baseline-packages.list) baseline packages).\"
           else
@@ -94,11 +94,11 @@ case "$cmd" in
       echo "=== 3. Cross-Node Package Parity (vs ${HOSTS[0]}) ==="
       echo "======================================================================"
       base_host="${HOSTS[0]}"
-      base_pkgs=$(ssh -n -T "$base_host" "apt-mark showmanual | sort")
+      base_pkgs=$(ssh -n -T "$base_host" "apt-mark showmanual | LC_ALL=C sort")
       for idx in "${!HOSTS[@]}"; do
         [ "$idx" -eq 0 ] && continue
         peer="${HOSTS[$idx]}"
-        diff_out=$(diff -u <(printf '%s\n' "$base_pkgs") <(ssh -n -T "$peer" "apt-mark showmanual | sort") || true)
+        diff_out=$(diff -u <(printf '%s\n' "$base_pkgs") <(ssh -n -T "$peer" "apt-mark showmanual | LC_ALL=C sort") || true)
         if [ -z "$diff_out" ]; then
           echo "  [OK] ${base_host} and ${peer} have 100% identical manual APT package sets."
         else
@@ -153,7 +153,7 @@ case "$cmd" in
 
   freeze-packages)
     for host in "${HOSTS[@]}"; do
-      ssh -n -T "$host" "apt-mark showmanual | sort | sudo tee /etc/ag-baseline-packages.list >/dev/null && sudo chmod 0644 /etc/ag-baseline-packages.list"
+      ssh -n -T "$host" "apt-mark showmanual | LC_ALL=C sort | sudo tee /etc/ag-baseline-packages.list >/dev/null && sudo chmod 0644 /etc/ag-baseline-packages.list"
       echo "[${host}] Saved $(ssh -n -T "$host" "wc -l < /etc/ag-baseline-packages.list") packages to /etc/ag-baseline-packages.list"
     done
     ;;
@@ -167,7 +167,7 @@ case "$cmd" in
           echo "No /etc/ag-baseline-packages.list found on $(hostname); skipping."
           exit 0
         fi
-        extra=$(comm -13 /etc/ag-baseline-packages.list <(apt-mark showmanual | sort) || true)
+        extra=$(LC_ALL=C comm -13 <(LC_ALL=C sort /etc/ag-baseline-packages.list) <(apt-mark showmanual | LC_ALL=C sort) || true)
         if [ -z "$extra" ]; then
           echo "  [OK] No extra packages to purge on $(hostname)."
         else

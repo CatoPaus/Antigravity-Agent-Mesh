@@ -34,6 +34,7 @@ set -euo pipefail
 
 FORCE_FORMAT_SCRATCH=0
 IDLE_LIMIT_MIN=30
+IDLE_EXPLICIT=0
 CCACHE_SIZE="25.0G"
 PRIMARY_NIC=""
 SECONDARY_NIC=""
@@ -55,7 +56,7 @@ while [ $# -gt 0 ]; do
     --dell-bios) DELL_BIOS_MODE="force" ;;
     --no-dell-bios) DELL_BIOS_MODE="skip" ;;
     --force-format-scratch) FORCE_FORMAT_SCRATCH=1 ;;
-    --idle-minutes) IDLE_LIMIT_MIN="${2:?Missing value for --idle-minutes}"; shift ;;
+    --idle-minutes) IDLE_LIMIT_MIN="${2:?Missing value for --idle-minutes}"; IDLE_EXPLICIT=1; shift ;;
     --ccache-size) CCACHE_SIZE="${2:?Missing value for --ccache-size}"; shift ;;
     --primary-nic) PRIMARY_NIC="${2:?Missing value for --primary-nic}"; shift ;;
     --secondary-nic) SECONDARY_NIC="${2:?Missing value for --secondary-nic}"; shift ;;
@@ -104,11 +105,19 @@ if [ -z "$PRIMARY_NIC" ]; then
   [ -n "$PRIMARY_NIC" ] || PRIMARY_NIC="enp0s25"
 fi
 
+IS_DESKTOP=0
+if systemctl is-active --quiet gdm3 lightdm sddm NetworkManager 2>/dev/null || [ -d /usr/share/xsessions ] || [ -d /usr/share/wayland-sessions ]; then
+  IS_DESKTOP=1
+fi
+if [ "$IS_DESKTOP" -eq 1 ] && [ "$IDLE_EXPLICIT" -eq 0 ]; then
+  IDLE_LIMIT_MIN=0
+fi
+
 log() {
   printf "\n[%s | %s] %s\n" "$HOST_NAME" "$(date +%H:%M:%S)" "$*"
 }
 
-log "Detected hardware: ${TOTAL_CPUS} threads across ${NUMA_NODES} NUMA node(s), ~${TOTAL_RAM_GB} GiB RAM, primary NIC ${PRIMARY_NIC}."
+log "Detected hardware: ${TOTAL_CPUS} threads across ${NUMA_NODES} NUMA node(s), ~${TOTAL_RAM_GB} GiB RAM, primary NIC ${PRIMARY_NIC} (desktop=${IS_DESKTOP})."
 
 # ==============================================================================
 # [1/9] Passwordless Sudo & Storage Layout (/ and /opt/mesh)
@@ -190,10 +199,11 @@ fi
 # [3/9] Dell Command | Configure (cctk) & Headless BIOS Optimization
 # ==============================================================================
 SYS_VENDOR=$(cat /sys/class/dmi/id/sys_vendor 2>/dev/null || echo "")
+SYS_PRODUCT=$(cat /sys/class/dmi/id/product_name 2>/dev/null || echo "")
 RUN_DELL_BIOS=0
 if [ "$DELL_BIOS_MODE" = "force" ]; then
   RUN_DELL_BIOS=1
-elif [ "$DELL_BIOS_MODE" = "auto" ] && echo "$SYS_VENDOR" | grep -qi "Dell"; then
+elif [ "$DELL_BIOS_MODE" = "auto" ] && [ "$IS_DESKTOP" -eq 0 ] && echo "$SYS_VENDOR" | grep -qi "Dell" && echo "$SYS_PRODUCT" | grep -qiE "Precision|PowerEdge"; then
   RUN_DELL_BIOS=1
 fi
 
@@ -276,13 +286,17 @@ EOF
   sudo udevadm control --reload-rules || true
 fi
 
-sudo systemctl disable --now \
-  multipathd.service multipathd.socket udisks2.service ModemManager.service \
-  apport.service snapd.service snapd.socket snapd.seeded.service \
-  snapd.apparmor.service lxd-installer.socket 2>/dev/null || true
-sudo systemctl mask \
-  multipathd.service multipathd.socket udisks2.service ModemManager.service \
-  apport.service 2>/dev/null || true
+if [ "$IS_DESKTOP" -eq 0 ]; then
+  sudo systemctl disable --now \
+    multipathd.service multipathd.socket udisks2.service ModemManager.service \
+    apport.service snapd.service snapd.socket snapd.seeded.service \
+    snapd.apparmor.service lxd-installer.socket 2>/dev/null || true
+  sudo systemctl mask \
+    multipathd.service multipathd.socket udisks2.service ModemManager.service \
+    apport.service 2>/dev/null || true
+else
+  log "Desktop environment detected; preserving snapd, udisks2, and NetworkManager."
+fi
 
 sudo tee "/etc/systemd/system/wol-${PRIMARY_NIC}.service" >/dev/null <<EOF
 [Unit]
@@ -301,8 +315,9 @@ EOF
 sudo systemctl daemon-reload
 sudo systemctl enable --now "wol-${PRIMARY_NIC}.service" >/dev/null 2>&1 || true
 
-if [ -n "$SECONDARY_NIC" ] && [ "$SECONDARY_NIC" != "$PRIMARY_NIC" ] && [ -d "/sys/class/net/${SECONDARY_NIC}" ]; then
-  sudo tee /etc/netplan/00-installer-config.yaml >/dev/null <<EOF
+if [ "$IS_DESKTOP" -eq 0 ] && ! systemctl is-active --quiet NetworkManager 2>/dev/null; then
+  if [ -n "$SECONDARY_NIC" ] && [ "$SECONDARY_NIC" != "$PRIMARY_NIC" ] && [ -d "/sys/class/net/${SECONDARY_NIC}" ]; then
+    sudo tee /etc/netplan/00-installer-config.yaml >/dev/null <<EOF
 network:
   ethernets:
     ${PRIMARY_NIC}:
@@ -314,8 +329,8 @@ network:
       optional: true
   version: 2
 EOF
-else
-  sudo tee /etc/netplan/00-installer-config.yaml >/dev/null <<EOF
+  else
+    sudo tee /etc/netplan/00-installer-config.yaml >/dev/null <<EOF
 network:
   ethernets:
     ${PRIMARY_NIC}:
@@ -323,9 +338,10 @@ network:
       wakeonlan: true
   version: 2
 EOF
+  fi
+  sudo chmod 600 /etc/netplan/00-installer-config.yaml
+  sudo netplan generate && sudo netplan apply
 fi
-sudo chmod 600 /etc/netplan/00-installer-config.yaml
-sudo netplan generate && sudo netplan apply
 
 sudo tee /etc/systemd/system/cpufreq-performance.service >/dev/null <<'EOF'
 [Unit]
@@ -554,7 +570,7 @@ fi
 ccache --set-config=cache_dir=/opt/mesh/cache/ccache --set-config=max_size="$CCACHE_SIZE" --set-config=compression=true
 CCACHE_DIR=/opt/mesh/cache/ccache ccache --set-config=cache_dir=/opt/mesh/cache/ccache --set-config=max_size="$CCACHE_SIZE" --set-config=compression=true
 sudo chown -R "${TARGET_USER}:${TARGET_USER}" /opt/mesh "${USER_HOME}"
-apt-mark showmanual | sort | sudo tee /etc/ag-baseline-packages.list >/dev/null
+apt-mark showmanual | LC_ALL=C sort | sudo tee /etc/ag-baseline-packages.list >/dev/null
 sudo chmod 0644 /etc/ag-baseline-packages.list
 
 mkdir -p "${USER_HOME}/.config/mesh"
@@ -598,7 +614,7 @@ sudo tee /usr/local/bin/ag-acp-worker >/dev/null <<EOF
 # Generic ACP stdio worker entrypoint with NUMA pinning + shared SSD build caches
 # Usage: ag-acp-worker <numa_node: 0|1|...|interleave> [workspace_subpath] [extra_agy_flags...]
 set -euo pipefail
-echo 0 > /run/ag-idle-minutes 2>/dev/null || true
+[ -w /run/ag-idle-minutes ] && echo 0 > /run/ag-idle-minutes 2>/dev/null || true
 
 NUMA_NODE="\${1:-0}"
 SUBPATH="\${2:-node\${NUMA_NODE}}"
@@ -643,7 +659,7 @@ sudo tee /usr/local/bin/ag-mesh-worktree >/dev/null <<'EOF'
 # Generic Bare-Repo + Multi-NUMA Git Worktree Provisioner
 # Usage: ag-mesh-worktree <project_name> [target_ref] [--preserve-untracked]
 set -euo pipefail
-echo 0 > /run/ag-idle-minutes 2>/dev/null || true
+[ -w /run/ag-idle-minutes ] && echo 0 > /run/ag-idle-minutes 2>/dev/null || true
 
 PROJECT="${1:?Usage: ag-mesh-worktree <project_name> [target_ref] [--preserve-untracked]}"
 TARGET_REF="${2:-refs/heads/mesh-sync}"
