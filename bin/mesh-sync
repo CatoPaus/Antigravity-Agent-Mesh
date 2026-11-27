@@ -239,7 +239,7 @@ case "$ACTION" in
       (
         ssh -n -T "$host" "[ -w /run/ag-idle-minutes ] && echo 0 > /run/ag-idle-minutes 2>/dev/null || true; mkdir -p '/opt/mesh/repos/${PROJECT}.git' && [ -d '/opt/mesh/repos/${PROJECT}.git/objects' ] || git init --bare --initial-branch=main '/opt/mesh/repos/${PROJECT}.git' >/dev/null"
         git push --quiet --force "ssh://${host}/opt/mesh/repos/${PROJECT}.git" "${SYNC_REV}:refs/heads/mesh-sync"
-        ssh -n -T "$host" "/usr/local/bin/ag-mesh-worktree '$PROJECT' refs/heads/mesh-sync --nodes '${host_nodes_csv}' $PRESERVE_FLAG $FORCE_FLAG"
+        ssh -n -T "$host" "if grep -q -- '--nodes' /usr/local/bin/ag-mesh-worktree 2>/dev/null; then /usr/local/bin/ag-mesh-worktree '$PROJECT' refs/heads/mesh-sync --nodes '${host_nodes_csv}' $PRESERVE_FLAG $FORCE_FLAG; else /usr/local/bin/ag-mesh-worktree '$PROJECT' refs/heads/mesh-sync $PRESERVE_FLAG; fi"
       ) &
       pids+=("$!")
     done

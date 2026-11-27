@@ -419,12 +419,21 @@ txt = txt.replace("{{SAMPLE_TARGET}}", sample)
 with open(dst, "w", encoding="utf-8") as f:
     f.write(txt)
 PYEOF
+  chmod 0644 "$RENDERED_RULE"
 
   cp "$RENDERED_RULE" "$HOME/.gemini/config/rules/mesh-cluster.md"
   cp "$RENDERED_RULE" "$HOME/.gemini/antigravity/rules/mesh-cluster.md"
   cp "$RENDERED_RULE" "$HOME/.gemini/antigravity-cli/rules/mesh-cluster.md"
+  chmod 0644 \
+    "$HOME/.gemini/config/rules/mesh-cluster.md" \
+    "$HOME/.gemini/antigravity/rules/mesh-cluster.md" \
+    "$HOME/.gemini/antigravity-cli/rules/mesh-cluster.md"
   echo "Installed rendered mesh-cluster.md into ~/.gemini/{config,antigravity,antigravity-cli}/rules/."
-  install_gemini_md_if_safe "$RENDERED_RULE" "$HOME/.gemini/GEMINI.md" '^# Antigravity NUMA Compute Mesh'
+  if [ "$OVERWRITE_GEMINI_MD" -eq 1 ] || [ -e "$HOME/.gemini/GEMINI.md" ] || [ ! -s "$HOME/.gemini/config/GEMINI.md" ]; then
+    install_gemini_md_if_safe "$RENDERED_RULE" "$HOME/.gemini/GEMINI.md" '^# Antigravity NUMA Compute Mesh'
+  else
+    echo "Preserved existing ${HOME}/.gemini/config/GEMINI.md (skipped legacy ~/.gemini/GEMINI.md; routing rules active via rules/mesh-cluster.md)."
+  fi
 
   if [ -n "$WIN_HOME" ]; then
     mkdir -p "${WIN_HOME}/.gemini/config/rules" "${WIN_HOME}/.gemini/antigravity/rules"
