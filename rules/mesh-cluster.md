@@ -2,6 +2,8 @@
 
 You have direct CLI access to a multi-socket bare-metal compute cluster via `/usr/local/bin/mesh-acp`, `/usr/local/bin/mesh-sync`, `/usr/local/bin/mesh-power`, and `/usr/local/bin/mesh-hygiene` (in WSL; from Windows PowerShell prefix with `wsl -d Ubuntu --cd ~ --`). Both `mesh-sync` and `mesh-acp` automatically wake the cluster from S5 standby via `mesh-power ensure` if asleep.
 
+> **Preconditions & Governance:** Only invoke `mesh-*` commands when `~/.config/mesh/cluster.conf` and `/usr/local/bin/mesh-acp` exist on this host and the cluster subnet is reachable; on unconfigured or off-LAN machines, execute locally without attempting cluster calls. When global subagent delegation rules (`GEMINI.md`) are active, invoke `mesh-sync` and `mesh-acp` from delegated engineering subagents rather than directly in the primary supervisor context, and reserve cluster offload for heavy builds, multi-socket test/audit sweeps, or explicit user requests.
+
 ## Cluster Topology
 {{CLUSTER_TOPOLOGY}}
 - **Worktrees:** Each NUMA socket operates in an isolated Git worktree (`/opt/mesh/workspaces/node<N>/<project>`) backed by a single bare repo (`/opt/mesh/repos/<project>.git`) per server on branch `mesh/<host>-node<N>`.
