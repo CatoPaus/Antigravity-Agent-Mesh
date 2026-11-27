@@ -3,10 +3,10 @@
 #
 # Transforms a fresh Ubuntu Server LTS installation (with OpenSSH + passwordless sudo) into a
 # hardware-pinned multi-socket NUMA compute node with:
-#   1. LVM root expansion + dedicated /opt/mesh ext4 scratch SSD (LABEL=mesh_scratch)
+#   1. LVM root expansion + dedicated /opt/mesh ext4 scratch SSD (LABEL=mesh_scratch, with blank-disk guard)
 #   2. Core build/NUMA/monitoring packages + optional --with-eda (KiCad/Freerouting) & --with-embedded (ARM GCC)
 #   3. Optional Dell Command | Configure (cctk) headless BIOS tuning (auto-detected on Dell hardware)
-#   4. Boot/udev/service debloat, Netplan Wake-on-LAN, wol-<nic>.service, cpufreq-performance.service
+#   4. Boot/udev/service debloat, Netplan Wake-on-LAN drop-in, wol-<nic>.service, cpufreq-performance.service
 #   5. Dynamic Cgroup v2 resource slice (antigravity.slice) + /usr/local/bin/ag-numa-exec
 #   6. TARS / CASE offline chassis speaker TTS (/usr/local/bin/ag-notify, opt-out via --no-tts)
 #   7. Shared /opt/mesh/cache (ccache, cargo, npm, pip) + ag-acp-worker + ag-mesh-worktree
@@ -26,11 +26,52 @@
 #   --no-dell-bios            Skip Dell cctk BIOS tuning even on Dell hardware
 #   --primary-nic <iface>     Primary WoL NIC (default: auto-detected default route NIC)
 #   --secondary-nic <iface>   Optional unused secondary NIC to power off in Netplan
-#   --scratch-disk <dev>      Scratch block device for /opt/mesh (default: /dev/sdb)
-#   --force-format-scratch    Reformat --scratch-disk as LABEL=mesh_scratch
+#   --scratch-disk <dev|none> Scratch block device for /opt/mesh, or 'none' (default: /dev/sdb)
+#   --force-format-scratch    Explicitly reformat --scratch-disk as LABEL=mesh_scratch
 #   --idle-minutes <N>        Idle minutes before S5 standby (0 disables watchdog, default: 30)
 #   --ccache-size <size>      Max ccache size (default: 25.0G)
 set -euo pipefail
+
+update_grub_cmdline() {
+  local grub_file="$1"
+  [ -f "$grub_file" ] || return 0
+  if grep -qE '^GRUB_CMDLINE_LINUX_DEFAULT=.*(^|[[:space:]"'\''])8250\.nr_uarts=' "$grub_file"; then
+    return 0
+  fi
+  local tmp_grub
+  tmp_grub=$(mktemp)
+  awk '
+    BEGIN { found = 0 }
+    /^GRUB_CMDLINE_LINUX_DEFAULT=/ {
+      found = 1
+      val = substr($0, index($0, "=") + 1)
+      q = "\""
+      if (val ~ /^".*"$/ || val ~ /^'\''.*'\''$/) {
+        q = substr(val, 1, 1)
+        val = substr(val, 2, length(val) - 2)
+      }
+      gsub(/^[ \t]+|[ \t]+$/, "", val)
+      if (length(val) > 0) {
+        print "GRUB_CMDLINE_LINUX_DEFAULT=" q val " 8250.nr_uarts=0" q
+      } else {
+        print "GRUB_CMDLINE_LINUX_DEFAULT=" q "8250.nr_uarts=0" q
+      }
+      next
+    }
+    { print }
+    END {
+      if (!found) {
+        print "GRUB_CMDLINE_LINUX_DEFAULT=\"8250.nr_uarts=0\""
+      }
+    }
+  ' "$grub_file" > "$tmp_grub"
+  sudo cp "$tmp_grub" "$grub_file"
+  rm -f "$tmp_grub"
+}
+
+if [ "${PROVISION_NODE_SOURCE_ONLY:-0}" = "1" ]; then
+  return 0 2>/dev/null || exit 0
+fi
 
 FORCE_FORMAT_SCRATCH=0
 IDLE_LIMIT_MIN=30
@@ -62,7 +103,7 @@ while [ $# -gt 0 ]; do
     --secondary-nic) SECONDARY_NIC="${2:?Missing value for --secondary-nic}"; shift ;;
     --scratch-disk) SCRATCH_DISK="${2:?Missing value for --scratch-disk}"; shift ;;
     -h|--help)
-      sed -n '2,31p' "$0" | sed 's/^# \{0,1\}//'
+      sed -n '2,32p' "$0" | sed 's/^# \{0,1\}//'
       exit 0
       ;;
     *) echo "Unknown option: $1" >&2; exit 1 ;;
@@ -79,6 +120,14 @@ if ! id "$TARGET_USER" >/dev/null 2>&1; then
 fi
 USER_HOME=$(getent passwd "$TARGET_USER" | cut -d: -f6)
 HOST_NAME="$(hostname)"
+
+run_as_target_user() {
+  if [ "$(id -un)" = "$TARGET_USER" ]; then
+    "$@"
+  else
+    sudo -u "$TARGET_USER" -H "$@"
+  fi
+}
 
 # Auto-detect hardware topology
 TOTAL_CPUS=$(nproc)
@@ -132,27 +181,64 @@ if sudo lvdisplay /dev/ubuntu-vg/ubuntu-lv >/dev/null 2>&1; then
   sudo resize2fs /dev/mapper/ubuntu--vg-ubuntu--lv 2>/dev/null || true
 fi
 
-if [ "$FORCE_FORMAT_SCRATCH" -eq 1 ] || ! sudo blkid -L mesh_scratch >/dev/null 2>&1; then
+sudo mkdir -p /opt/mesh
+
+if [ "${SCRATCH_DISK,,}" = "none" ] || [ -z "$SCRATCH_DISK" ]; then
+  log "Scratch disk disabled (--scratch-disk none); using /opt/mesh on root filesystem."
+else
   if [ -b "$SCRATCH_DISK" ]; then
-    log "Formatting scratch SSD $SCRATCH_DISK as ext4 (LABEL=mesh_scratch)..."
+    crit_mnt=$(lsblk -nr -o MOUNTPOINTS "$SCRATCH_DISK" 2>/dev/null | awk '$1 ~ /^(\/|\/boot|\/boot\/efi|\/home|\/var|\[SWAP\])$/ {print $1; exit}' || true)
+    if [ -z "$crit_mnt" ]; then
+      crit_mnt=$(lsblk -nr -o MOUNTPOINT "$SCRATCH_DISK" 2>/dev/null | awk '$1 ~ /^(\/|\/boot|\/boot\/efi|\/home|\/var|\[SWAP\])$/ {print $1; exit}' || true)
+    fi
+    if [ -n "$crit_mnt" ]; then
+      echo "Error: Refusing to format $SCRATCH_DISK because it backs critical system mountpoint '$crit_mnt'." >&2
+      exit 1
+    fi
+  fi
+
+  if [ "$FORCE_FORMAT_SCRATCH" -eq 0 ] && sudo blkid -L mesh_scratch >/dev/null 2>&1; then
+    log "Existing LABEL=mesh_scratch detected; preserving /opt/mesh contents."
+  elif [ ! -b "$SCRATCH_DISK" ]; then
+    log "WARNING: Block device $SCRATCH_DISK not found and LABEL=mesh_scratch not present; using /opt/mesh on root filesystem."
+  elif [ "$FORCE_FORMAT_SCRATCH" -eq 1 ]; then
+    log "Formatting scratch SSD $SCRATCH_DISK as ext4 (LABEL=mesh_scratch) via --force-format-scratch..."
     sudo umount /opt/mesh 2>/dev/null || true
     sudo wipefs -a "$SCRATCH_DISK"
     sudo mkfs.ext4 -F -L mesh_scratch "$SCRATCH_DISK"
   else
-    log "WARNING: Block device $SCRATCH_DISK not found and LABEL=mesh_scratch not present; using /opt/mesh on root filesystem."
+    has_mounts=0
+    if lsblk -nr -o MOUNTPOINT "$SCRATCH_DISK" 2>/dev/null | grep -q .; then
+      has_mounts=1
+    fi
+    has_children=0
+    if [ "$(lsblk -nr -o NAME "$SCRATCH_DISK" 2>/dev/null | wc -l)" -gt 1 ]; then
+      has_children=1
+    fi
+    has_signatures=0
+    if sudo blkid "$SCRATCH_DISK" >/dev/null 2>&1 || [ -n "$(sudo wipefs -n "$SCRATCH_DISK" 2>/dev/null)" ]; then
+      has_signatures=1
+    fi
+
+    if [ "$has_mounts" -eq 1 ] || [ "$has_children" -eq 1 ] || [ "$has_signatures" -eq 1 ]; then
+      log "WARNING: Refusing to auto-format $SCRATCH_DISK because existing partitions, mounts, or filesystem signatures were detected."
+      log "         Pass --force-format-scratch to wipe $SCRATCH_DISK or --scratch-disk none to silence this warning; falling back to /opt/mesh on root filesystem."
+    else
+      log "Blank scratch SSD $SCRATCH_DISK detected; formatting as ext4 (LABEL=mesh_scratch)..."
+      sudo wipefs -a "$SCRATCH_DISK"
+      sudo mkfs.ext4 -F -L mesh_scratch "$SCRATCH_DISK"
+    fi
   fi
-else
-  log "Existing LABEL=mesh_scratch detected; preserving /opt/mesh contents."
+
+  if sudo blkid -L mesh_scratch >/dev/null 2>&1; then
+    if ! grep -q "LABEL=mesh_scratch" /etc/fstab; then
+      echo "LABEL=mesh_scratch /opt/mesh ext4 defaults,noatime,nofail 0 2" | sudo tee -a /etc/fstab >/dev/null
+    fi
+    sudo systemctl daemon-reload
+    sudo mount -a
+  fi
 fi
 
-sudo mkdir -p /opt/mesh
-if sudo blkid -L mesh_scratch >/dev/null 2>&1; then
-  if ! grep -q "LABEL=mesh_scratch" /etc/fstab; then
-    echo "LABEL=mesh_scratch /opt/mesh ext4 defaults,noatime,nofail 0 2" | sudo tee -a /etc/fstab >/dev/null
-  fi
-  sudo systemctl daemon-reload
-  sudo mount -a
-fi
 sudo systemctl enable --now fstrim.timer >/dev/null 2>&1 || true
 sudo chown -R "${TARGET_USER}:${TARGET_USER}" /opt/mesh
 
@@ -210,16 +296,20 @@ fi
 if [ "$RUN_DELL_BIOS" -eq 1 ]; then
   log "[3/9] Dell hardware detected (${SYS_VENDOR}); installing cctk and tuning BIOS..."
   if [ ! -x /opt/dell/dcc/cctk ]; then
-    mkdir -p /tmp/dell-dcc
+    tmp_dcc=$(mktemp -d /tmp/dell-dcc.XXXXXX)
     (
-      cd /tmp/dell-dcc
-      curl -A "Mozilla/5.0" -fsSL -o dcc.tar.gz \
+      cd "$tmp_dcc"
+      curl --proto '=https' --tlsv1.2 --retry 3 -A "Mozilla/5.0" -fsSL -o dcc.tar.gz \
         "https://dl.dell.com/FOLDER12705845M/1/command-configure_5.1.0-6.ubuntu24_amd64.tar.gz"
+      if ! tar -tzf dcc.tar.gz >/dev/null 2>&1; then
+        echo "Error: Downloaded dcc.tar.gz failed tar gzip integrity check." >&2
+        exit 1
+      fi
       tar -xzf dcc.tar.gz
       sudo dpkg -i srvadmin-hapi_*.deb || sudo DEBIAN_FRONTEND=noninteractive apt-get install -f -y -qq
       sudo dpkg -i command-configure_*.deb || sudo DEBIAN_FRONTEND=noninteractive apt-get install -f -y -qq
     )
-    rm -rf /tmp/dell-dcc
+    rm -rf "$tmp_dcc"
   fi
   sudo ln -sf /opt/dell/dcc/cctk /usr/local/bin/cctk
 
@@ -277,7 +367,7 @@ else
 fi
 
 if [ "$RUN_DELL_BIOS" -eq 1 ] && [ -f /etc/default/grub ]; then
-  sudo sed -i 's/^GRUB_CMDLINE_LINUX_DEFAULT=.*/GRUB_CMDLINE_LINUX_DEFAULT="8250.nr_uarts=0"/' /etc/default/grub
+  update_grub_cmdline /etc/default/grub
   sudo update-grub >/dev/null 2>&1 || true
 
   sudo tee /etc/udev/rules.d/99-disable-card-reader.rules >/dev/null <<'EOF'
@@ -315,32 +405,43 @@ EOF
 sudo systemctl daemon-reload
 sudo systemctl enable --now "wol-${PRIMARY_NIC}.service" >/dev/null 2>&1 || true
 
-if [ "$IS_DESKTOP" -eq 0 ] && ! systemctl is-active --quiet NetworkManager 2>/dev/null; then
-  if [ -n "$SECONDARY_NIC" ] && [ "$SECONDARY_NIC" != "$PRIMARY_NIC" ] && [ -d "/sys/class/net/${SECONDARY_NIC}" ]; then
-    sudo tee /etc/netplan/00-installer-config.yaml >/dev/null <<EOF
-network:
-  ethernets:
-    ${PRIMARY_NIC}:
-      dhcp4: true
-      wakeonlan: true
-    ${SECONDARY_NIC}:
-      dhcp4: false
-      activation-mode: off
-      optional: true
-  version: 2
-EOF
+if [ "$IS_DESKTOP" -eq 0 ] && ! systemctl is-active --quiet NetworkManager 2>/dev/null && command -v netplan >/dev/null 2>&1; then
+  sudo mkdir -p /etc/netplan
+  NETPLAN_DROPIN="/etc/netplan/90-antigravity-mesh-wol.yaml"
+  nic_configured=0
+  for np_f in /etc/netplan/*.yaml; do
+    [ -f "$np_f" ] || continue
+    [ "$(basename "$np_f")" = "90-antigravity-mesh-wol.yaml" ] && continue
+    if sudo grep -qE "(^|[[:space:]])${PRIMARY_NIC}:" "$np_f" 2>/dev/null; then
+      nic_configured=1
+      break
+    fi
+  done
+
+  {
+    echo "# Managed by Antigravity Agent Mesh (preserves existing Netplan IP configuration)"
+    echo "network:"
+    echo "  version: 2"
+    echo "  ethernets:"
+    echo "    ${PRIMARY_NIC}:"
+    if [ "$nic_configured" -eq 0 ]; then
+      echo "      dhcp4: true"
+    fi
+    echo "      wakeonlan: true"
+    if [ -n "$SECONDARY_NIC" ] && [ "$SECONDARY_NIC" != "$PRIMARY_NIC" ] && [ -d "/sys/class/net/${SECONDARY_NIC}" ]; then
+      echo "    ${SECONDARY_NIC}:"
+      echo "      dhcp4: false"
+      echo "      activation-mode: off"
+      echo "      optional: true"
+    fi
+  } | sudo tee "$NETPLAN_DROPIN" >/dev/null
+  sudo chmod 600 "$NETPLAN_DROPIN"
+  if sudo netplan generate 2>/dev/null; then
+    sudo netplan apply
   else
-    sudo tee /etc/netplan/00-installer-config.yaml >/dev/null <<EOF
-network:
-  ethernets:
-    ${PRIMARY_NIC}:
-      dhcp4: true
-      wakeonlan: true
-  version: 2
-EOF
+    log "WARNING: netplan generate rejected ${NETPLAN_DROPIN}; removing drop-in to preserve active network."
+    sudo rm -f "$NETPLAN_DROPIN"
   fi
-  sudo chmod 600 /etc/netplan/00-installer-config.yaml
-  sudo netplan generate && sudo netplan apply
 fi
 
 sudo tee /etc/systemd/system/cpufreq-performance.service >/dev/null <<'EOF'
@@ -467,13 +568,15 @@ if [ -z "$CALLER" ]; then
   fi
 fi
 
+SAFE_CALLER="$(printf '%s' "$CALLER" | sed 's/[\/&\\]/\\&/g')"
+
 speak() {
   local text="$1"
   text="$(printf '%s' "$text" | sed -E \
-    -e "s/\b(Mr\.?|Mister)[[:space:]]+Cooper\b/${CALLER}/gi" \
-    -e "s/\b(Dr\.?|Doctor)[[:space:]]+Brand\b/${CALLER}/gi" \
-    -e "s/\b(Cooper|Coop)\b/${CALLER}/gi" \
-    -e "s/\\\$\(whoami\)|@whoami/${CALLER}/gi")"
+    -e "s/\b(Mr\.?|Mister)[[:space:]]+Cooper\b/${SAFE_CALLER}/gi" \
+    -e "s/\b(Dr\.?|Doctor)[[:space:]]+Brand\b/${SAFE_CALLER}/gi" \
+    -e "s/\b(Cooper|Coop)\b/${SAFE_CALLER}/gi" \
+    -e "s/\\\$\(whoami\)|@whoami/${SAFE_CALLER}/gi")"
   espeak-ng -a 150 -v "$VOICE" -s "$SPEED" -p "$PITCH" --stdout "$text" 2>/dev/null \
     | play -q -t wav - pad 0.20 0.30 $SOX_VOICE_FX 2>/dev/null || true
 }
@@ -563,8 +666,14 @@ done
 ln -sfn /opt/mesh/tools "${USER_HOME}/tools"
 
 if [ "$WITH_EDA" -eq 1 ] && [ ! -f /opt/mesh/tools/freerouting.jar ]; then
-  curl -fsSL -L -o /opt/mesh/tools/freerouting.jar \
-    "https://github.com/freerouting/freerouting/releases/download/v2.0.1/freerouting-2.0.1.jar" 2>/dev/null || true
+  if curl --proto '=https' --tlsv1.2 --retry 3 -fsSL -L -o /opt/mesh/tools/freerouting.jar.tmp \
+    "https://github.com/freerouting/freerouting/releases/download/v2.0.1/freerouting-2.0.1.jar" 2>/dev/null \
+    && python3 -m zipfile -t /opt/mesh/tools/freerouting.jar.tmp >/dev/null 2>&1; then
+    mv /opt/mesh/tools/freerouting.jar.tmp /opt/mesh/tools/freerouting.jar
+  else
+    log "WARNING: Failed to download or verify /opt/mesh/tools/freerouting.jar; removing partial file."
+    rm -f /opt/mesh/tools/freerouting.jar.tmp /opt/mesh/tools/freerouting.jar
+  fi
 fi
 
 ccache --set-config=cache_dir=/opt/mesh/cache/ccache --set-config=max_size="$CCACHE_SIZE" --set-config=compression=true
@@ -657,22 +766,63 @@ sudo chmod +x /usr/local/bin/ag-acp-worker
 sudo tee /usr/local/bin/ag-mesh-worktree >/dev/null <<'EOF'
 #!/usr/bin/env bash
 # Generic Bare-Repo + Multi-NUMA Git Worktree Provisioner
-# Usage: ag-mesh-worktree <project_name> [target_ref] [--preserve-untracked]
+# Usage: ag-mesh-worktree <project_name> [target_ref] [--preserve-untracked] [--nodes <csv>] [--force]
 set -euo pipefail
 [ -w /run/ag-idle-minutes ] && echo 0 > /run/ag-idle-minutes 2>/dev/null || true
 
-PROJECT="${1:?Usage: ag-mesh-worktree <project_name> [target_ref] [--preserve-untracked]}"
-TARGET_REF="${2:-refs/heads/mesh-sync}"
-PRESERVE="${3:-}"
+PROJECT="${1:?Usage: ag-mesh-worktree <project_name> [target_ref] [--preserve-untracked] [--nodes <csv>] [--force]}"
+shift
+TARGET_REF="refs/heads/mesh-sync"
+if [ $# -gt 0 ] && [[ ! "$1" =~ ^-- ]]; then
+  TARGET_REF="$1"
+  shift
+fi
 
-BARE_REPO="/opt/mesh/repos/${PROJECT}.git"
+PRESERVE=0
+FORCE=0
+NODES_CSV=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --preserve-untracked|--keep-build) PRESERVE=1 ;;
+    --force|-f) FORCE=1 ;;
+    --nodes) NODES_CSV="${2:?Missing value for --nodes}"; shift ;;
+    --nodes=*) NODES_CSV="${1#*=}" ;;
+    *) echo "Error: Unknown option '$1' in ag-mesh-worktree" >&2; exit 1 ;;
+  esac
+  shift
+done
+
+MESH_ROOT="${AG_MESH_ROOT:-/opt/mesh}"
+BARE_REPO="${MESH_ROOT}/repos/${PROJECT}.git"
 HOST="$(hostname)"
-NUMA_COUNT=$(ls -d /sys/devices/system/node/node[0-9]* 2>/dev/null | wc -l)
+if [ -n "${AG_NUMA_COUNT:-}" ]; then
+  NUMA_COUNT="$AG_NUMA_COUNT"
+else
+  NUMA_COUNT=$(ls -d /sys/devices/system/node/node[0-9]* 2>/dev/null | wc -l)
+fi
 [ "$NUMA_COUNT" -ge 1 ] || NUMA_COUNT=1
 
-mkdir -p "/opt/mesh/repos"
+TARGET_NODES=()
+if [ -n "$NODES_CSV" ]; then
+  IFS="," read -r -a _raw_nodes <<< "$NODES_CSV"
+  for n in "${_raw_nodes[@]}"; do
+    n="${n//[[:space:]]/}"
+    [ -z "$n" ] && continue
+    if ! [[ "$n" =~ ^[0-9]+$ ]] || [ "$n" -ge "$NUMA_COUNT" ]; then
+      echo "Error: Invalid NUMA socket index '$n' on ${HOST} (available: 0..$((NUMA_COUNT - 1)))." >&2
+      exit 1
+    fi
+    TARGET_NODES+=("$n")
+  done
+else
+  for ((node=0; node<NUMA_COUNT; node++)); do
+    TARGET_NODES+=("$node")
+  done
+fi
+
+mkdir -p "${MESH_ROOT}/repos"
 for ((node=0; node<NUMA_COUNT; node++)); do
-  mkdir -p "/opt/mesh/workspaces/node${node}"
+  mkdir -p "${MESH_ROOT}/workspaces/node${node}"
 done
 
 if [ ! -d "$BARE_REPO" ]; then
@@ -688,8 +838,38 @@ if ! git rev-parse --verify --quiet "${TARGET_REF}^{commit}" >/dev/null; then
   exit 1
 fi
 
-for ((node=0; node<NUMA_COUNT; node++)); do
-  WT_DIR="/opt/mesh/workspaces/node${node}/${PROJECT}"
+# Pre-flight busy check across all targeted sockets before mutating any worktree
+if [ "$FORCE" -eq 0 ]; then
+  for node in "${TARGET_NODES[@]}"; do
+    WT_DIR="${MESH_ROOT}/workspaces/node${node}/${PROJECT}"
+    [ -d "$WT_DIR" ] || continue
+    wt_real=$(realpath "$WT_DIR" 2>/dev/null || echo "$WT_DIR")
+    busy_reason=""
+    worker_pid=$(pgrep -f "(^|/)ag-acp-worker[[:space:]]+${node}([[:space:]]|$)" 2>/dev/null | grep -vx "$$" | head -n 1 || true)
+    if [ -n "$worker_pid" ]; then
+      busy_reason="active ag-acp-worker (pid ${worker_pid}) on node${node}"
+    else
+      for cwd_link in /proc/[0-9]*/cwd; do
+        pid="${cwd_link#/proc/}"
+        pid="${pid%/cwd}"
+        [ "$pid" = "$$" ] && continue
+        p_cwd=$(readlink "$cwd_link" 2>/dev/null || true)
+        if [ "$p_cwd" = "$wt_real" ] || [[ "$p_cwd" == "$wt_real/"* ]]; then
+          p_comm=$(cat "/proc/$pid/comm" 2>/dev/null || echo "process")
+          busy_reason="process ${p_comm} (pid ${pid}) active in ${WT_DIR}"
+          break
+        fi
+      done
+    fi
+    if [ -n "$busy_reason" ]; then
+      echo "Error: Refusing to reset busy worktree ${WT_DIR} (${busy_reason}). Pass --force to override." >&2
+      exit 1
+    fi
+  done
+fi
+
+for node in "${TARGET_NODES[@]}"; do
+  WT_DIR="${MESH_ROOT}/workspaces/node${node}/${PROJECT}"
   BRANCH="mesh/${HOST}-node${node}"
 
   if ! git -C "$WT_DIR" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
@@ -698,7 +878,7 @@ for ((node=0; node<NUMA_COUNT; node++)); do
   else
     git -C "$WT_DIR" checkout -B "$BRANCH" "$TARGET_REF" --quiet
     git -C "$WT_DIR" reset --hard "$TARGET_REF" >/dev/null
-    if [ "$PRESERVE" != "--preserve-untracked" ]; then
+    if [ "$PRESERVE" -eq 0 ]; then
       git -C "$WT_DIR" clean -fd >/dev/null
     fi
   fi
@@ -844,9 +1024,18 @@ fi
 log "[9/9] Installing/verifying Antigravity CLI (agy) and systemd user daemon..."
 
 if [ ! -x "${USER_HOME}/.local/bin/agy" ]; then
-  curl -fsSL https://antigravity.google/cli/install.sh | bash
+  agy_installer=$(mktemp /tmp/agy-install.XXXXXX.sh)
+  if curl --proto '=https' --tlsv1.2 --retry 3 -fsSL -o "$agy_installer" "https://antigravity.google/cli/install.sh" && [ -s "$agy_installer" ]; then
+    chmod 0755 "$agy_installer"
+    run_as_target_user bash "$agy_installer"
+    rm -f "$agy_installer"
+  else
+    rm -f "$agy_installer"
+    echo "Error: Failed to download https://antigravity.google/cli/install.sh" >&2
+    exit 1
+  fi
 else
-  "${USER_HOME}/.local/bin/agy" update 2>/dev/null || true
+  run_as_target_user "${USER_HOME}/.local/bin/agy" update 2>/dev/null || true
 fi
 
 export PATH="${USER_HOME}/.local/bin:$PATH"

@@ -82,11 +82,13 @@ chmod +x bootstrap-mesh.sh provision-node.sh bin/* scripts/*
   --provision-nodes --sync-auth --reboot-nodes --verify
 ```
 
-**Optional Toolchain Flags:**
+**Optional Toolchain & Safety Flags:**
 - `--with-eda` — Installs KiCad 10 PPA, headless JRE, and `freerouting.jar`.
 - `--with-embedded` — Installs `gcc-arm-none-eabi` bare-metal ARM toolchain.
 - `--no-tts` — Skips ALSA/SoX/MBROLA chassis speaker TTS installation.
 - `--no-dell-bios` — Skips Dell Command | Configure (`cctk`) BIOS tuning (auto-detected by default).
+- `--scratch-disk <dev|none>` — Scratch SSD block device for `/opt/mesh` (`/dev/sdb` default, auto-formatted only when blank; pass `--force-format-scratch` to wipe an existing disk or `none` to use the root filesystem).
+- `--overwrite-gemini-md` — Overwrites an existing custom `~/.gemini/GEMINI.md` (by default, custom `GEMINI.md` files are preserved untouched while routing rules install into `~/.gemini/{config,antigravity,antigravity-cli}/rules/`).
 
 ### 3. Verify & Run Your First Multi-Socket Dispatch
 ```bash
@@ -122,10 +124,17 @@ Antigravity-Agent-Mesh/
 ├── scripts/
 │   ├── probe-node.sh          # CPU, NUMA, memory, disk, PCIe, and NIC discovery probe
 │   └── test-sleep-wake.sh     # End-to-end S5 sleep & Wake-on-LAN benchmark test
+├── tests/
+│   └── test_mesh.py           # Hermetic regression tests (ACP, Git snapshot, worktree & syntax)
 └── docs/
     ├── SETUP-MANUAL.md        # Full step-by-step build, usage & TTS manual
     ├── DELL-T7610-BIOS.md     # Dell Precision T7610 BIOS, cctk & DIMM NUMA guide
     └── ARCHITECTURE.md        # Deep-dive on ACP, cgroups, Git snapshots & ccache
+```
+
+Run the local hermetic test suite anytime with:
+```bash
+python3 -m unittest discover -s tests -v
 ```
 
 ---

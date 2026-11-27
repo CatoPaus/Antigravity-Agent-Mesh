@@ -2,19 +2,27 @@
 # mesh-hygiene: Cluster-wide workspace, $HOME, package-drift, and cache hygiene manager
 # Usage:
 #   mesh-hygiene status              # Audit $HOME stray files, APT package drift, worktrees, and cache sizes
-#   mesh-hygiene clean               # Scrub stray files in $HOME, /tmp, and apt cache on all nodes
+#   mesh-hygiene clean               # Scrub stray files in $HOME, stale /tmp entries, and apt cache on all nodes
 #   mesh-hygiene freeze-packages     # Record current apt-mark showmanual as /etc/ag-baseline-packages.list
 #   mesh-hygiene reset-packages      # Autopurge any ad-hoc APT packages not in /etc/ag-baseline-packages.list
 #   mesh-hygiene prune-caches        # Clear pip/npm/xdg caches and evict old ccache entries
 set -euo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+if [ "${1:-}" = "-h" ] || [ "${1:-}" = "--help" ]; then
+  sed -n '2,8p' "$0" | sed 's/^# \{0,1\}//'
+  exit 0
+fi
+
+MESH_NODES=()
 MESH_CONFIG="${MESH_CONFIG:-${HOME}/.config/mesh/cluster.conf}"
 if [ -f "$MESH_CONFIG" ]; then
   # shellcheck disable=SC1090
   source "$MESH_CONFIG"
 fi
 
-if [ "${#MESH_NODES[@]}" -eq 0 ] 2>/dev/null; then
+if [ "${#MESH_NODES[@]}" -eq 0 ]; then
   echo "Error: No nodes configured. Run bootstrap-mesh.sh or create ${MESH_CONFIG}." >&2
   exit 1
 fi
@@ -25,11 +33,29 @@ for entry in "${MESH_NODES[@]}"; do
   HOSTS+=("$_name")
 done
 
-ALLOWED_HOME_REGEX='^(\.antigravity-hub-server|\.bash_history|\.bash_logout|\.bash_profile|\.bashrc|\.cache|\.config|\.gemini|\.gitconfig|\.lesshst|\.local|\.npm|\.profile|\.ssh|\.sudo_as_admin_successful|\.wget-hsts|\.zprofile|\.zshrc|Desktop|Documents|Downloads|Music|Pictures|Public|Templates|Videos|snap|tools)$'
+ALLOWED_HOME_REGEX='^(\.antigravity-hub-server|\.bash_history|\.bash_logout|\.bash_profile|\.bashrc|\.cache|\.cargo|\.config|\.docker|\.gemini|\.gitconfig|\.gnupg|\.kube|\.lesshst|\.local|\.npm|\.profile|\.rustup|\.ssh|\.sudo_as_admin_successful|\.tmux\.conf|\.venv|\.vimrc|\.wget-hsts|\.zprofile|\.zshrc|Desktop|Documents|Downloads|Music|Pictures|Public|Templates|Videos|snap|tools)$'
 
-if [ -x /usr/local/bin/mesh-power ]; then
-  /usr/local/bin/mesh-power ensure
+POWER_BIN=""
+if command -v mesh-power >/dev/null 2>&1; then
+  POWER_BIN="$(command -v mesh-power)"
+elif [ -x "${SCRIPT_DIR}/mesh-power" ]; then
+  POWER_BIN="${SCRIPT_DIR}/mesh-power"
+elif [ -x /usr/local/bin/mesh-power ]; then
+  POWER_BIN="/usr/local/bin/mesh-power"
 fi
+if [ -n "$POWER_BIN" ]; then
+  "$POWER_BIN" ensure
+fi
+
+SYNC_BIN=""
+if command -v mesh-sync >/dev/null 2>&1; then
+  SYNC_BIN="$(command -v mesh-sync)"
+elif [ -x "${SCRIPT_DIR}/mesh-sync" ]; then
+  SYNC_BIN="${SCRIPT_DIR}/mesh-sync"
+elif [ -x /usr/local/bin/mesh-sync ]; then
+  SYNC_BIN="/usr/local/bin/mesh-sync"
+fi
+
 for h in "${HOSTS[@]}"; do
   ssh -n -T "$h" "[ -w /run/ag-idle-minutes ] && echo 0 > /run/ag-idle-minutes 2>/dev/null || true" &
 done
@@ -42,8 +68,8 @@ case "$cmd" in
     echo "======================================================================"
     echo "=== 1. Active Project Worktrees (/opt/mesh) ==="
     echo "======================================================================"
-    if [ -x /usr/local/bin/mesh-sync ]; then
-      /usr/local/bin/mesh-sync list
+    if [ -n "$SYNC_BIN" ]; then
+      "$SYNC_BIN" list
     fi
 
     for host in "${HOSTS[@]}"; do
@@ -65,9 +91,10 @@ case "$cmd" in
         echo \"--- Stray Files in \${USER_HOME} (should be NONE) ---\"
         stray=\$(ls -A \"\$USER_HOME\" | grep -Ev '${ALLOWED_HOME_REGEX}' || true)
         if [ -z \"\$stray\" ]; then
-          echo \"  [OK] \${USER_HOME} is 100% clean (only dotfiles + tools -> /opt/mesh/tools).\"
+          echo \"  [OK] \${USER_HOME} is 100% clean (only allowed dotfiles + tools -> /opt/mesh/tools).\"
         else
-          echo \"\$stray\" | while read -r item; do
+          printf '%s\n' \"\$stray\" | while IFS= read -r item; do
+            [ -z \"\$item\" ] && continue
             du -sh \"\${USER_HOME}/\$item\" 2>/dev/null | awk '{printf \"  [STRAY] %-8s %s\n\", \$1, \$2}'
           done
         fi
@@ -111,7 +138,7 @@ case "$cmd" in
 
   clean)
     for host in "${HOSTS[@]}"; do
-      echo "=== Cleaning stray \$HOME files, /tmp, and APT cache on ${host} ==="
+      echo "=== Cleaning stray \$HOME files, stale /tmp entries, and APT cache on ${host} ==="
       ssh -n -T "$host" "
         set -euo pipefail
         USER_NAME=\$(id -un)
@@ -132,13 +159,17 @@ case "$cmd" in
         sudo chown -R \"\${USER_NAME}:\${USER_NAME}\" /opt/mesh/cache /opt/mesh/tools \"\${USER_HOME}\"
 
         # Remove any stray files/folders in \$HOME outside the allowed set
-        for item in \$(ls -A \"\$USER_HOME\" | grep -Ev '${ALLOWED_HOME_REGEX}' || true); do
+        while IFS= read -r item; do
+          [ -z \"\$item\" ] && continue
           echo \"  Removing stray: \${USER_HOME}/\$item\"
           rm -rf \"\${USER_HOME}/\$item\"
-        done
+        done < <(ls -A \"\$USER_HOME\" | grep -Ev '${ALLOWED_HOME_REGEX}' || true)
 
-        # Clean non-systemd temporary files in /tmp, crash logs, and ambiguous HEAD refs
-        find /tmp -mindepth 1 -maxdepth 1 ! -name 'systemd-private-*' ! -name 'pulse-*' ! -name '.X*' ! -name '.ICE*' ! -name '.font*' ! -name 'snap-private-tmp' -exec rm -rf {} + 2>/dev/null || true
+        # Clean stale (>60m) non-session temporary files in /tmp, crash logs, and ambiguous HEAD refs
+        find /tmp -mindepth 1 -maxdepth 1 -mmin +60 \
+          ! -name 'systemd-private-*' ! -name 'pulse-*' ! -name '.X*' ! -name '.ICE*' ! -name '.font*' \
+          ! -name 'snap-private-tmp' ! -name 'ssh-*' ! -name 'tmux-*' ! -name 'screen-*' \
+          -exec rm -rf {} + 2>/dev/null || true
         rm -rf \"\${USER_HOME}/.gemini/antigravity-cli/crashes/\"* 2>/dev/null || true
         for r in /opt/mesh/repos/*.git; do
           [ -d \"\$r\" ] && git -C \"\$r\" update-ref -d refs/heads/HEAD 2>/dev/null || true
@@ -171,8 +202,8 @@ case "$cmd" in
         if [ -z "$extra" ]; then
           echo "  [OK] No extra packages to purge on $(hostname)."
         else
-          echo "  Purging extra packages: $extra"
-          sudo DEBIAN_FRONTEND=noninteractive apt-get purge -y $extra
+          echo "  Purging extra packages: $(echo "$extra" | tr "\n" " ")"
+          printf "%s\n" "$extra" | xargs -r sudo DEBIAN_FRONTEND=noninteractive apt-get purge -y
           sudo DEBIAN_FRONTEND=noninteractive apt-get autoremove -y --purge
           sudo apt-get clean
         fi
@@ -192,7 +223,7 @@ case "$cmd" in
     ;;
 
   *)
-    echo "Usage: mesh-hygiene {status|clean|freeze-packages|reset-packages|prune-caches}"
+    echo "Usage: mesh-hygiene {status|clean|freeze-packages|reset-packages|prune-caches}" >&2
     exit 1
     ;;
 esac

@@ -21,11 +21,11 @@ Select the optimal model for every delegated task based on complexity:
    ```
 2. **Parallel Asymmetric Task Split (Run `mesh-acp --list-targets` to see available sockets):**
    ```bash
-   mesh-sync push --keep-build
+   mesh-sync push --keep-build --target {{SAMPLE_TARGET}}
    mesh-acp {{SAMPLE_TARGET}} "<heavy build task>" --model gemini-4-argon-high --skip-perms --no-stream &
-   # dispatch additional sockets in parallel...
+   # dispatch additional sockets in parallel (use --target <spec> to avoid resetting busy sibling sockets)...
    wait
-   mesh-sync fetch
+   mesh-sync fetch --target {{SAMPLE_TARGET}}
    ```
 3. **Inspecting & Merging Subagent Commits Locally:**
    After `mesh-sync fetch`, subagent branches are available locally at `refs/remotes/mesh/<target>`:

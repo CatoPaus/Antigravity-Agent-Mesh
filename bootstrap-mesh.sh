@@ -18,13 +18,15 @@
 #   --primary-nic <iface>              Primary WoL NIC on remote nodes (default: auto-detected)
 #   --secondary-nic <iface>            Optional unused secondary NIC to power off (default: none)
 #   --ssh-autowake                     Add Match originalhost WoL auto-wake hook to SSH configs
+#   --overwrite-gemini-md              Overwrite existing custom ~/.gemini/GEMINI.md files
 #
 # Provisioning Options (forwarded to provision-node.sh):
 #   --with-eda                         Install KiCad 10 + JRE + freerouting.jar on nodes
 #   --with-embedded                    Install ARM bare-metal GCC toolchain on nodes
 #   --no-tts                           Disable chassis speaker TTS setup
 #   --dell-bios / --no-dell-bios       Force or skip Dell cctk BIOS tuning (default: auto-detect)
-#   --scratch-disk <dev>               Scratch SSD device for /opt/mesh (default: /dev/sdb)
+#   --scratch-disk <dev|none>          Scratch SSD device for /opt/mesh, or 'none' (default: /dev/sdb)
+#   --force-format-scratch             Explicitly wipe and format --scratch-disk as LABEL=mesh_scratch
 #   --idle-minutes <N>                 Idle S5 standby timeout in minutes (0 disables, default: 30)
 #   --ccache-size <size>               Shared ccache limit (default: 25.0G)
 #
@@ -49,12 +51,14 @@ SECONDARY_NIC=""
 IDLE_LIMIT_MIN=""
 CCACHE_SIZE=""
 SCRATCH_DISK=""
+FORCE_FORMAT_SCRATCH=0
 WITH_EDA=0
 WITH_EMBEDDED=0
 NO_TTS=0
 DELL_BIOS_FLAG=""
 SSH_AUTOWAKE=0
 SKIP_NODE_RULES=0
+OVERWRITE_GEMINI_MD=0
 
 CONTROL_PLANE_ONLY=0
 DO_PROVISION_NODES=0
@@ -72,9 +76,11 @@ while [ $# -gt 0 ]; do
     --primary-nic) PRIMARY_NIC="${2:?Missing value for --primary-nic}"; shift ;;
     --secondary-nic) SECONDARY_NIC="${2:?Missing value for --secondary-nic}"; shift ;;
     --ssh-autowake) SSH_AUTOWAKE=1 ;;
+    --overwrite-gemini-md) OVERWRITE_GEMINI_MD=1 ;;
     --idle-minutes) IDLE_LIMIT_MIN="${2:?Missing value for --idle-minutes}"; shift ;;
     --ccache-size) CCACHE_SIZE="${2:?Missing value for --ccache-size}"; shift ;;
     --scratch-disk) SCRATCH_DISK="${2:?Missing value for --scratch-disk}"; shift ;;
+    --force-format-scratch) FORCE_FORMAT_SCRATCH=1 ;;
     --with-eda) WITH_EDA=1 ;;
     --with-embedded) WITH_EMBEDDED=1 ;;
     --no-tts) NO_TTS=1 ;;
@@ -88,7 +94,7 @@ while [ $# -gt 0 ]; do
     --reboot-nodes) DO_REBOOT_NODES=1; EXPLICIT_ACTION=1 ;;
     --verify|--verify-only) DO_VERIFY=1; EXPLICIT_ACTION=1 ;;
     -h|--help)
-      sed -n '2,38p' "$0" | sed 's/^# \{0,1\}//'
+      sed -n '2,40p' "$0" | sed 's/^# \{0,1\}//'
       exit 0
       ;;
     *)
@@ -119,6 +125,18 @@ run_root() {
     /mnt/c/Windows/System32/wsl.exe -d "$WSL_DISTRO_NAME" -u root -- "$@" < /dev/null
   else
     sudo "$@"
+  fi
+}
+
+install_gemini_md_if_safe() {
+  local src="$1"
+  local dst="$2"
+  local managed_header_regex="$3"
+  if [ "$OVERWRITE_GEMINI_MD" -eq 1 ] || [ ! -s "$dst" ] || head -n 1 "$dst" 2>/dev/null | grep -Eq "$managed_header_regex"; then
+    cp "$src" "$dst"
+    echo "Updated managed ${dst}"
+  else
+    echo "Preserved existing custom ${dst} (routing rules remain active via rules/mesh-cluster.md; pass --overwrite-gemini-md to replace)."
   fi
 }
 
@@ -179,6 +197,7 @@ for req in provision-node.sh bin/mesh-power bin/mesh-sync bin/mesh-acp bin/mesh-
 done
 
 # Load existing cluster.conf if present and no --node overrides were provided
+MESH_NODES=()
 NODE_SPECS=()
 if [ "${#RAW_NODES[@]}" -eq 0 ] && [ -f "$MESH_CONFIG" ]; then
   # shellcheck disable=SC1090
@@ -229,8 +248,14 @@ setup_control_plane() {
   step "Stage 1: Installing Control-Plane Dependencies & SSH Config (WSL & Windows)"
 
   if ! command -v wakeonlan >/dev/null 2>&1 || ! command -v jq >/dev/null 2>&1; then
-    run_root env DEBIAN_FRONTEND=noninteractive apt-get update -qq
-    run_root env DEBIAN_FRONTEND=noninteractive apt-get install -y -qq wakeonlan jq openssh-client python3
+    if command -v apt-get >/dev/null 2>&1; then
+      run_root env DEBIAN_FRONTEND=noninteractive apt-get update -qq
+      run_root env DEBIAN_FRONTEND=noninteractive apt-get install -y -qq wakeonlan jq openssh-client python3
+    else
+      echo "Error: Required dependencies (jq and/or wakeonlan) are missing and apt-get is not available." >&2
+      echo "       Install jq, wakeonlan, openssh-client, and python3 with your distro package manager first." >&2
+      exit 1
+    fi
   fi
 
   mkdir -p "$HOME/.ssh/controlmasters" "$(dirname "$MESH_CONFIG")"
@@ -395,17 +420,18 @@ with open(dst, "w", encoding="utf-8") as f:
     f.write(txt)
 PYEOF
 
-  cp "$RENDERED_RULE" "$HOME/.gemini/GEMINI.md"
   cp "$RENDERED_RULE" "$HOME/.gemini/config/rules/mesh-cluster.md"
   cp "$RENDERED_RULE" "$HOME/.gemini/antigravity/rules/mesh-cluster.md"
   cp "$RENDERED_RULE" "$HOME/.gemini/antigravity-cli/rules/mesh-cluster.md"
-  echo "Installed rendered mesh-cluster.md into ~/.gemini/ paths."
+  echo "Installed rendered mesh-cluster.md into ~/.gemini/{config,antigravity,antigravity-cli}/rules/."
+  install_gemini_md_if_safe "$RENDERED_RULE" "$HOME/.gemini/GEMINI.md" '^# Antigravity NUMA Compute Mesh'
 
   if [ -n "$WIN_HOME" ]; then
-    mkdir -p "${WIN_HOME}/.gemini/config/rules"
-    cp "$RENDERED_RULE" "${WIN_HOME}/.gemini/GEMINI.md"
+    mkdir -p "${WIN_HOME}/.gemini/config/rules" "${WIN_HOME}/.gemini/antigravity/rules"
     cp "$RENDERED_RULE" "${WIN_HOME}/.gemini/config/rules/mesh-cluster.md"
-    echo "Installed rendered mesh-cluster.md into ${WIN_HOME}/.gemini/ paths."
+    cp "$RENDERED_RULE" "${WIN_HOME}/.gemini/antigravity/rules/mesh-cluster.md"
+    echo "Installed rendered mesh-cluster.md into ${WIN_HOME}/.gemini/ rule paths."
+    install_gemini_md_if_safe "$RENDERED_RULE" "${WIN_HOME}/.gemini/GEMINI.md" '^# Antigravity NUMA Compute Mesh'
   fi
   rm -f "$RENDERED_RULE"
 }
@@ -418,6 +444,7 @@ provision_remote_nodes() {
   /usr/local/bin/mesh-power ensure
 
   PROV_ARGS=("--user" "$REMOTE_USER" "--idle-minutes" "$IDLE_LIMIT_MIN" "--ccache-size" "$CCACHE_SIZE" "--scratch-disk" "$SCRATCH_DISK")
+  [ "$FORCE_FORMAT_SCRATCH" -eq 1 ] && PROV_ARGS+=("--force-format-scratch")
   [ -n "$PRIMARY_NIC" ] && PROV_ARGS+=("--primary-nic" "$PRIMARY_NIC")
   [ -n "$SECONDARY_NIC" ] && PROV_ARGS+=("--secondary-nic" "$SECONDARY_NIC")
   [ "$WITH_EDA" -eq 1 ] && PROV_ARGS+=("--with-eda")
@@ -434,7 +461,14 @@ provision_remote_nodes() {
     ) &
     pids+=("$!")
   done
-  for pid in "${pids[@]}"; do wait "$pid"; done
+  rc=0
+  for pid in "${pids[@]}"; do
+    wait "$pid" || rc=1
+  done
+  if [ "$rc" -ne 0 ]; then
+    echo "Error: Remote provisioning failed on one or more nodes." >&2
+    exit 1
+  fi
 }
 
 # ------------------------------------------------------------------------------
@@ -446,8 +480,25 @@ sync_node_rules() {
 
   for entry in "${NODE_SPECS[@]}"; do
     IFS="|" read -r alias _ip _mac _numas _persona _desc <<< "$entry"
-    ssh -T "$alias" "mkdir -p \$HOME/.gemini/config/rules && cat > \$HOME/.gemini/config/rules/mesh-node.md && cp \$HOME/.gemini/config/rules/mesh-node.md \$HOME/.gemini/GEMINI.md" < "${SCRIPT_DIR}/rules/mesh-node.md"
-    echo "[${alias}] Installed ~/.gemini/GEMINI.md and ~/.gemini/config/rules/mesh-node.md"
+    {
+      cat <<'REMOTE_HEAD'
+set -euo pipefail
+mkdir -p "$HOME/.gemini/config/rules" "$HOME/.gemini/antigravity/rules" "$HOME/.gemini/antigravity-cli/rules"
+cat <<'MESH_NODE_RULE_EOF' > "$HOME/.gemini/config/rules/mesh-node.md"
+REMOTE_HEAD
+      cat "${SCRIPT_DIR}/rules/mesh-node.md"
+      cat <<'REMOTE_TAIL'
+MESH_NODE_RULE_EOF
+cp "$HOME/.gemini/config/rules/mesh-node.md" "$HOME/.gemini/antigravity/rules/mesh-node.md"
+cp "$HOME/.gemini/config/rules/mesh-node.md" "$HOME/.gemini/antigravity-cli/rules/mesh-node.md"
+if [ "${OVERWRITE_GEMINI_MD:-0}" -eq 1 ] || [ ! -s "$HOME/.gemini/GEMINI.md" ] || head -n 1 "$HOME/.gemini/GEMINI.md" 2>/dev/null | grep -Eq '^# Antigravity Mesh (Compute )?Node'; then
+  cp "$HOME/.gemini/config/rules/mesh-node.md" "$HOME/.gemini/GEMINI.md"
+  echo "[$(hostname)] Installed ~/.gemini/config/rules/mesh-node.md and updated ~/.gemini/GEMINI.md"
+else
+  echo "[$(hostname)] Installed ~/.gemini/config/rules/mesh-node.md (preserved custom ~/.gemini/GEMINI.md)"
+fi
+REMOTE_TAIL
+    } | ssh -T "$alias" "OVERWRITE_GEMINI_MD=${OVERWRITE_GEMINI_MD} bash -s"
   done
 }
 
@@ -497,7 +548,12 @@ verify_cluster() {
 
   echo "=== 1. Control-Plane Entrypoints, Config & Rule Mirrors ==="
   ls -lh /usr/local/bin/mesh-power /usr/local/bin/mesh-sync /usr/local/bin/mesh-acp /usr/local/bin/mesh-hygiene \
-    "$MESH_CONFIG" "$HOME/.gemini/GEMINI.md" "$HOME/.gemini/config/rules/mesh-cluster.md"
+    "$MESH_CONFIG" "$HOME/.gemini/config/rules/mesh-cluster.md"
+  if [ -f "$HOME/.gemini/GEMINI.md" ]; then
+    ls -lh "$HOME/.gemini/GEMINI.md"
+  else
+    echo "  (Note: $HOME/.gemini/GEMINI.md not present; rules active via $HOME/.gemini/config/rules/mesh-cluster.md)"
+  fi
 
   echo "=== 2. Registered ACP Subagents in settings.json ==="
   jq -r '.acpServers | keys[]' "$HOME/.gemini/antigravity-cli/settings.json" | sed 's/^/  - /'
@@ -546,6 +602,10 @@ EOF
     echo "      Run 'mesh-power ensure' or 'mesh-acp all ...' to wake them automatically."
   fi
 }
+
+if [ "${BOOTSTRAP_MESH_SOURCE_ONLY:-0}" = "1" ]; then
+  return 0 2>/dev/null || exit 0
+fi
 
 setup_control_plane
 

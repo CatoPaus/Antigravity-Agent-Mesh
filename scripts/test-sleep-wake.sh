@@ -1,14 +1,22 @@
 #!/usr/bin/env bash
 # test-sleep-wake.sh: End-to-end S5 sleep, Wake-on-LAN Magic Packet, boot timing & daemon verification
+# Usage:
+#   ./scripts/test-sleep-wake.sh
 set -euo pipefail
 
+if [ "${1:-}" = "-h" ] || [ "${1:-}" = "--help" ]; then
+  sed -n '2,4p' "$0" | sed 's/^# \{0,1\}//'
+  exit 0
+fi
+
+MESH_NODES=()
 MESH_CONFIG="${MESH_CONFIG:-${HOME}/.config/mesh/cluster.conf}"
 if [ -f "$MESH_CONFIG" ]; then
   # shellcheck disable=SC1090
   source "$MESH_CONFIG"
 fi
 
-if [ "${#MESH_NODES[@]}" -eq 0 ] 2>/dev/null; then
+if [ "${#MESH_NODES[@]}" -eq 0 ]; then
   echo "Error: No nodes configured. Run bootstrap-mesh.sh or create ${MESH_CONFIG}." >&2
   exit 1
 fi

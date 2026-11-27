@@ -49,11 +49,13 @@ chmod +x bootstrap-mesh.sh provision-node.sh bin/* scripts/*
 
 ### Optional Flags
 - `--ssh-autowake` — Adds a `Match originalhost <alias> exec ...` WoL hook in `~/.ssh/config` (WSL & Windows) so connecting from the Antigravity App wakes sleeping S5 nodes automatically.
+- `--overwrite-gemini-md` — Replaces an existing custom `~/.gemini/GEMINI.md` (by default, custom `GEMINI.md` files are preserved untouched and routing rules load from `~/.gemini/{config,antigravity,antigravity-cli}/rules/mesh-cluster.md`).
 - `--sync-node-rules` / `--no-node-rules` — Installs (or skips) [`rules/mesh-node.md`](../rules/mesh-node.md) into `~/.gemini/` on remote nodes for `(SSH: <host>)` sessions.
 - `--with-eda` — Installs KiCad 10 PPA, headless JRE, and `/opt/mesh/tools/freerouting.jar`.
 - `--with-embedded` — Installs `gcc-arm-none-eabi`, `libnewlib-arm-none-eabi`, and `libstdc++-arm-none-eabi-newlib`.
 - `--no-tts` — Skips ALSA, SoX, `espeak-ng`, and MBROLA speaker setup.
 - `--no-dell-bios` / `--dell-bios` — Overrides automatic Dell DMI detection for `cctk` BIOS tuning.
+- `--scratch-disk <dev|none>` — Scratch SSD device for `/opt/mesh` (`/dev/sdb` default, formatted automatically only when blank/unpartitioned; pass `--force-format-scratch` to wipe an existing disk or `none` to keep `/opt/mesh` on rootfs).
 - `--idle-minutes <N>` — Sets idle timeout before S5 poweroff (`30` default; `0` disables `ag-idle-watchdog.timer`).
 - `--ccache-size <size>` — Sets shared `ccache` limit (`25.0G` default).
 - `--control-plane-only` — Updates local `/usr/local/bin/mesh-*`, `~/.config/mesh/cluster.conf`, SSH configs, and rules without touching remote nodes.
@@ -98,12 +100,12 @@ mesh-acp --list-targets
 # Run one prompt across every NUMA socket (auto-wake + push + fetch)
 mesh-acp all "Run pytest and report failures." --model gemini-4-argon-medium --sync --keep-build --fetch --skip-perms
 
-# Asymmetric parallel fan-out
-mesh-sync push --keep-build
+# Asymmetric parallel fan-out (target-scoped push/fetch preserves busy sibling sockets)
+mesh-sync push --keep-build --target node2-node0,node1-node0
 mesh-acp node2-node0 "Compile release binary" --model gemini-4-argon-high --skip-perms --no-stream &
 mesh-acp node1-node0 "Run integration tests"  --model gemini-4-argon-medium --skip-perms --no-stream &
 wait
-mesh-sync fetch
+mesh-sync fetch --target node2-node0,node1-node0
 
 # Multi-turn resume on a single socket
 mesh-acp node2-node0 "Now run benchmarks on the binary." --continue --skip-perms
@@ -126,6 +128,9 @@ mesh-hygiene status
 mesh-hygiene clean
 mesh-hygiene freeze-packages
 mesh-hygiene reset-packages
+
+# Run local hermetic regression test suite
+python3 -m unittest discover -s tests -v
 ```
 
 ---

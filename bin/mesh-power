@@ -9,11 +9,17 @@
 #   mesh-power say    <message...>
 set -euo pipefail
 
+if [ "${1:-}" = "-h" ] || [ "${1:-}" = "--help" ]; then
+  sed -n '2,9p' "$0" | sed 's/^# \{0,1\}//'
+  exit 0
+fi
+
 if [ "${1:-}" = "ensure" ] && [ "${MESH_POWER_INNER:-0}" = "1" ]; then
   exit 0
 fi
 export MESH_POWER_INNER=1
 
+MESH_NODES=()
 MESH_CONFIG="${MESH_CONFIG:-${HOME}/.config/mesh/cluster.conf}"
 if [ -f "$MESH_CONFIG" ]; then
   # shellcheck disable=SC1090
@@ -22,7 +28,7 @@ fi
 
 MESH_BCAST="${MESH_BCAST:-192.168.1.255}"
 MESH_IDLE_MINUTES="${MESH_IDLE_MINUTES:-30}"
-if [ "${#MESH_NODES[@]}" -eq 0 ] 2>/dev/null; then
+if [ "${#MESH_NODES[@]}" -eq 0 ]; then
   echo "Error: No nodes configured. Run bootstrap-mesh.sh or create ${MESH_CONFIG}." >&2
   exit 1
 fi

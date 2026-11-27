@@ -7,16 +7,31 @@ Usage:
            [--system-prompt TEXT] [--add-dir DIR] [--skip-perms] [--no-stream]
   mesh-acp --list-targets
 """
-import asyncio
 import argparse
+import asyncio
+import hashlib
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_TARGETS = ["node1-node0", "node1-node1", "node2-node0", "node2-node1"]
 STREAM_LIMIT = 16 * 1024 * 1024  # 16 MiB line buffer for large tool/diff payloads
+STDERR_TAIL_BYTES = 64 * 1024     # Bounded 64 KiB tail buffer for diagnostics
+
+
+def resolve_mesh_bin(name: str) -> str | None:
+    """Locate sibling mesh CLI tool via PATH, script directory, or /usr/local/bin."""
+    found = shutil.which(name)
+    if found:
+        return found
+    for candidate in (os.path.join(SCRIPT_DIR, name), f"/usr/local/bin/{name}"):
+        if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+            return candidate
+    return None
 
 
 def load_cluster_targets() -> tuple[list[str], list[str]]:
@@ -63,14 +78,21 @@ def resolve_targets(spec: str, all_targets: list[str], hosts: list[str]) -> list
     return list(dict.fromkeys(chosen))
 
 
-def session_cache_path(target: str) -> str:
-    return f"/tmp/mesh-acp-last-{target}.session"
+def session_cache_dir() -> str:
+    cache_root = os.environ.get("XDG_CACHE_HOME") or os.path.expanduser("~/.cache")
+    return os.path.join(cache_root, "mesh", "sessions")
 
 
-def load_last_session(target: str) -> str | None:
-    path = session_cache_path(target)
+def session_cache_path(target: str, cwd: str) -> str:
+    safe_target = re.sub(r"[^A-Za-z0-9._-]", "_", target)
+    cwd_hash = hashlib.sha256(cwd.encode("utf-8")).hexdigest()[:12]
+    return os.path.join(session_cache_dir(), f"{safe_target}--{cwd_hash}.session")
+
+
+def load_last_session(target: str, cwd: str) -> str | None:
+    path = session_cache_path(target, cwd)
     try:
-        if os.path.exists(path):
+        if os.path.isfile(path):
             with open(path, "r", encoding="utf-8") as f:
                 val = f.read().strip()
                 return val or None
@@ -79,10 +101,16 @@ def load_last_session(target: str) -> str | None:
     return None
 
 
-def save_last_session(target: str, session_id: str) -> None:
+def save_last_session(target: str, cwd: str, session_id: str) -> None:
     try:
-        with open(session_cache_path(target), "w", encoding="utf-8") as f:
+        sess_dir = session_cache_dir()
+        os.makedirs(sess_dir, mode=0o700, exist_ok=True)
+        os.chmod(sess_dir, 0o700)
+        path = session_cache_path(target, cwd)
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
             f.write(session_id.strip() + "\n")
+        os.chmod(path, 0o600)
     except Exception:
         pass
 
@@ -128,7 +156,50 @@ async def run_worker(target: str, prompt: str, args, auto_project: str | None, m
         limit=STREAM_LIMIT,
     )
 
+    stderr_buf = bytearray()
+
+    async def drain_stderr() -> None:
+        assert proc.stderr is not None
+        while True:
+            chunk = await proc.stderr.read(4096)
+            if not chunk:
+                break
+            stderr_buf.extend(chunk)
+            if len(stderr_buf) > STDERR_TAIL_BYTES:
+                del stderr_buf[:-STDERR_TAIL_BYTES]
+
+    stderr_task = asyncio.create_task(drain_stderr())
+
+    async def finalize_proc(timeout: float = 5.0) -> tuple[int | None, str]:
+        if proc.stdin and not proc.stdin.is_closing():
+            try:
+                proc.stdin.close()
+            except Exception:
+                pass
+        try:
+            await asyncio.wait_for(proc.wait(), timeout=timeout)
+        except asyncio.TimeoutError:
+            try:
+                proc.terminate()
+            except ProcessLookupError:
+                pass
+            try:
+                await asyncio.wait_for(proc.wait(), timeout=2.0)
+            except asyncio.TimeoutError:
+                try:
+                    proc.kill()
+                except ProcessLookupError:
+                    pass
+                await proc.wait()
+        try:
+            await asyncio.wait_for(stderr_task, timeout=2.0)
+        except asyncio.TimeoutError:
+            stderr_task.cancel()
+        err_text = bytes(stderr_buf).decode("utf-8", errors="replace").strip()
+        return proc.returncode, err_text
+
     async def send(payload: dict):
+        assert proc.stdin is not None
         line = json.dumps(payload, separators=(",", ":")) + "\n"
         proc.stdin.write(line.encode("utf-8"))
         await proc.stdin.drain()
@@ -146,15 +217,19 @@ async def run_worker(target: str, prompt: str, args, auto_project: str | None, m
             await send({"jsonrpc": "2.0", "id": msg["id"], "result": {}})
 
     async def recv_until_id(expected_id: int) -> dict:
+        assert proc.stdout is not None
         while True:
             raw = await proc.stdout.readline()
             if not raw:
-                err = (await proc.stderr.read()).decode("utf-8", errors="replace").strip()
-                raise RuntimeError(f"[{target}] EOF waiting for id={expected_id}. stderr: {err}")
+                rc_proc, err = await finalize_proc()
+                raise RuntimeError(f"[{target}] EOF waiting for id={expected_id} (rc={rc_proc}). stderr: {err}")
             line = raw.decode("utf-8", errors="replace").strip()
             if not line.startswith("{"):
                 continue
-            msg = json.loads(line)
+            try:
+                msg = json.loads(line)
+            except json.JSONDecodeError:
+                continue
 
             if "id" in msg and "method" in msg:
                 await handle_server_request(msg)
@@ -198,7 +273,7 @@ async def run_worker(target: str, prompt: str, args, auto_project: str | None, m
         if args.system_prompt:
             session_params["_meta"] = {"antigravity": {"systemPrompt": {"append": args.system_prompt}}}
 
-        resume_id = args.resume or (load_last_session(target) if args.continue_last else None)
+        resume_id = args.resume or (load_last_session(target, cwd) if args.continue_last else None)
         session_id = None
         if resume_id:
             try:
@@ -213,7 +288,9 @@ async def run_worker(target: str, prompt: str, args, auto_project: str | None, m
                 sess = await recv_until_id(next_id)
                 session_id = sess.get("sessionId") or resume_id
                 next_id += 1
-            except Exception:
+            except Exception as exc:
+                if proc.returncode is not None:
+                    raise exc
                 next_id += 1
                 session_id = None
 
@@ -228,7 +305,7 @@ async def run_worker(target: str, prompt: str, args, auto_project: str | None, m
             session_id = sess["sessionId"]
             next_id += 1
 
-        save_last_session(target, session_id)
+        save_last_session(target, cwd, session_id)
 
         # 3. Mode override
         if args.mode:
@@ -254,6 +331,7 @@ async def run_worker(target: str, prompt: str, args, auto_project: str | None, m
 
         # 5. Dispatch prompt
         chunks = []
+        saw_prompt_result = False
         await send({
             "jsonrpc": "2.0",
             "id": next_id,
@@ -264,6 +342,7 @@ async def run_worker(target: str, prompt: str, args, auto_project: str | None, m
             },
         })
 
+        assert proc.stdout is not None
         while True:
             raw = await proc.stdout.readline()
             if not raw:
@@ -271,7 +350,10 @@ async def run_worker(target: str, prompt: str, args, auto_project: str | None, m
             line = raw.decode("utf-8", errors="replace").strip()
             if not line.startswith("{"):
                 continue
-            msg = json.loads(line)
+            try:
+                msg = json.loads(line)
+            except json.JSONDecodeError:
+                continue
 
             if "id" in msg and "method" in msg:
                 await handle_server_request(msg)
@@ -295,7 +377,14 @@ async def run_worker(target: str, prompt: str, args, auto_project: str | None, m
                     txt = msg["result"].get("text", "")
                     if txt:
                         chunks.append(txt)
+                saw_prompt_result = True
                 break
+
+        if not saw_prompt_result:
+            rc_proc, err = await finalize_proc()
+            raise RuntimeError(
+                f"[{target}] Unexpected EOF before session/prompt response (id={next_id}, rc={rc_proc}). stderr: {err}"
+            )
 
         if not args.stream or multi:
             full_text = "".join(chunks).strip()
@@ -303,12 +392,18 @@ async def run_worker(target: str, prompt: str, args, auto_project: str | None, m
         else:
             print()
 
-        proc.stdin.close()
-        await proc.wait()
+        await finalize_proc()
         return 0
     except Exception as exc:
+        try:
+            proc.kill()
+        except ProcessLookupError:
+            pass
+        try:
+            await finalize_proc(timeout=1.0)
+        except Exception:
+            pass
         sys.stderr.write(f"{exc}\n")
-        proc.kill()
         return 1
 
 
@@ -321,9 +416,9 @@ async def main():
     parser.add_argument("--list-targets", action="store_true", help="Print configured cluster targets and exit")
     parser.add_argument("--subpath", default=None, help="Explicit workspace subdir under /opt/mesh/workspaces/")
     parser.add_argument("--no-project", action="store_true", help="Do not auto-infer project subpath from current Git repo")
-    parser.add_argument("--sync", action="store_true", help="Run 'mesh-sync push' before dispatching prompt")
+    parser.add_argument("--sync", action="store_true", help="Run target-scoped 'mesh-sync push' before dispatching prompt")
     parser.add_argument("--keep-build", action="store_true", help="Pass --keep-build to mesh-sync when --sync is used")
-    parser.add_argument("--fetch", action="store_true", help="Run 'mesh-sync fetch' after subagent prompt completes")
+    parser.add_argument("--fetch", action="store_true", help="Run target-scoped 'mesh-sync fetch' after subagent prompt completes")
     parser.add_argument("--mode", default="accept-edits", help="Session mode (default, accept-edits, plan)")
     parser.add_argument("--model", default=None, help="Override modelId (e.g., gemini-4-argon-high, gemini-3.8-flash-high)")
     parser.add_argument("--resume", default=None, help="Resume a specific ACP sessionId via session/resume (agy 1.5.0+)")
@@ -343,14 +438,19 @@ async def main():
         parser.error("target and prompt are required (unless --list-targets is specified)")
 
     targets = resolve_targets(args.target, all_targets, hosts)
+    target_csv = ",".join(targets)
     auto_project = None if (args.no_project or args.subpath is not None) else detect_git_project()
 
     target_hosts = list(dict.fromkeys(t.rsplit("-node", 1)[0] for t in targets))
-    if os.path.exists("/usr/local/bin/mesh-power"):
-        subprocess.run(["/usr/local/bin/mesh-power", "ensure", *target_hosts], check=True)
+    power_bin = resolve_mesh_bin("mesh-power")
+    if power_bin:
+        subprocess.run([power_bin, "ensure", *target_hosts], check=True)
 
+    sync_bin = resolve_mesh_bin("mesh-sync")
     if args.sync:
-        sync_cmd = ["/usr/local/bin/mesh-sync", "push"]
+        if not sync_bin:
+            raise SystemExit("Error: mesh-sync binary not found.")
+        sync_cmd = [sync_bin, "push", "--target", target_csv]
         if args.keep_build:
             sync_cmd.append("--keep-build")
         subprocess.run(sync_cmd, check=True)
@@ -360,7 +460,9 @@ async def main():
     rc = max(results)
 
     if args.fetch and rc == 0:
-        subprocess.run(["/usr/local/bin/mesh-sync", "fetch"], check=True)
+        if not sync_bin:
+            raise SystemExit("Error: mesh-sync binary not found.")
+        subprocess.run([sync_bin, "fetch", "--target", target_csv], check=True)
 
     sys.exit(rc)
 
